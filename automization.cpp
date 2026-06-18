@@ -38,7 +38,6 @@ constexpr int DateDelta = 693594;
 constexpr int SecsPerDay = 86400;
 constexpr int DATE_STR_SIZE = 32;
 constexpr int TIME_STR_SIZE = 16;
-constexpr double NEAR_ZERO_FLOW_TOLERANCE = 0.0001;
 const char* const MonthTxt[] =
 {
     "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -1264,7 +1263,7 @@ struct SubcatchVariableComparisonSpec
 {
     int index = 0;
     const char* name = "";
-    double tolerancePercent = 0.0;
+    ToleranceQuantity quantity = ToleranceQuantity::Flow;
     bool requireExactMatch = false;
 };
 
@@ -1272,15 +1271,15 @@ const std::vector<SubcatchVariableComparisonSpec>& subcatchVariableComparisonSpe
 {
     static const std::vector<SubcatchVariableComparisonSpec> specs =
     {
-        { 0, "SUBCATCH_RAINFALL", 0.0, true },
-        { 1, "SUBCATCH_SNOWDEPTH/SURM_BASEFLOW", 2.0, false },
-        { 2, "SUBCATCH_EVAP", 5.0, false },
-        { 3, "SUBCATCH_INFIL", 5.0, false },
-        { 4, "SUBCATCH_PERVIOUS_RUNOFF", 5.0, false },
-        { 5, "SUBCATCH_GW_FLOW", 5.0, false },
-        { 6, "SUBCATCH_GW_ELEV", 5.0, false },
-        { 7, "SUBCATCH_SOIL_MOIST", 5.0, false },
-        { 8, "SUBCATCH_IMPERVIOUS_RUNOFF", 5.0, false }
+        { 0, "SUBCATCH_RAINFALL", ToleranceQuantity::Flow, true },
+        { 1, "SUBCATCH_SNOWDEPTH/SURM_BASEFLOW", ToleranceQuantity::Depth, false },
+        { 2, "SUBCATCH_EVAP", ToleranceQuantity::Flow, false },
+        { 3, "SUBCATCH_INFIL", ToleranceQuantity::Flow, false },
+        { 4, "SUBCATCH_PERVIOUS_RUNOFF", ToleranceQuantity::Flow, false },
+        { 5, "SUBCATCH_GW_FLOW", ToleranceQuantity::Flow, false },
+        { 6, "SUBCATCH_GW_ELEV", ToleranceQuantity::Depth, false },
+        { 7, "SUBCATCH_SOIL_MOIST", ToleranceQuantity::PercentPoint, false },
+        { 8, "SUBCATCH_IMPERVIOUS_RUNOFF", ToleranceQuantity::Flow, false }
     };
 
     return specs;
@@ -1307,36 +1306,85 @@ std::string formatDeviation(double deviationPercent)
     return output.str();
 }
 
-bool bothValuesAreNearZero(double originalValue, double newValue)
+enum class ComparisonStatus
 {
-    return std::fabs(originalValue) < NEAR_ZERO_FLOW_TOLERANCE &&
-        std::fabs(newValue) < NEAR_ZERO_FLOW_TOLERANCE;
+    Pass,
+    Warn,
+    Fail
+};
+
+const char* comparisonStatusText(ComparisonStatus status)
+{
+    switch (status)
+    {
+    case ComparisonStatus::Pass:
+        return "PASS";
+    case ComparisonStatus::Warn:
+        return "WARN";
+    case ComparisonStatus::Fail:
+        return "FAIL";
+    default:
+        return "FAIL";
+    }
 }
 
-double percentageDeviation(double originalValue, double newValue, bool allowNearZeroFlowMismatch = false)
+void combineStatus(ComparisonStatus& aggregateStatus, ComparisonStatus newStatus)
 {
-    if (allowNearZeroFlowMismatch && bothValuesAreNearZero(originalValue, newValue))
-        return 0.0;
+    if (newStatus == ComparisonStatus::Fail)
+        aggregateStatus = ComparisonStatus::Fail;
+    else if (newStatus == ComparisonStatus::Warn && aggregateStatus == ComparisonStatus::Pass)
+        aggregateStatus = ComparisonStatus::Warn;
+}
 
+double percentageDeviation(double originalValue, double newValue)
+{
     if (originalValue == 0.0)
         return newValue == 0.0 ? 0.0 : std::numeric_limits<double>::infinity();
 
     return std::fabs((newValue - originalValue) / originalValue) * 100.0;
 }
 
-bool percentageValuePasses(
+struct ValueComparisonResult
+{
+    ComparisonStatus status = ComparisonStatus::Pass;
+    double percentDeviation = 0.0;
+    double absoluteDifference = 0.0;
+    bool usedAbsolute = false;
+    double checkedDifference = 0.0;
+};
+
+ValueComparisonResult compareValuesWithTolerance(
     double originalValue,
     double newValue,
-    double tolerancePercent,
-    bool allowNearZeroFlowMismatch = false)
+    const ToleranceRule& rule)
 {
-    if (allowNearZeroFlowMismatch && bothValuesAreNearZero(originalValue, newValue))
-        return true;
+    ValueComparisonResult result;
+    result.percentDeviation = percentageDeviation(originalValue, newValue);
+    result.absoluteDifference = std::fabs(newValue - originalValue);
+    result.usedAbsolute =
+        rule.useAbsoluteAlways ||
+        (rule.useAbsoluteBelowNearZero &&
+            (std::fabs(originalValue) < rule.nearZeroThreshold ||
+                std::fabs(newValue) < rule.nearZeroThreshold));
 
-    if (originalValue == 0.0)
-        return newValue == 0.0;
+    if (result.usedAbsolute)
+    {
+        result.checkedDifference = result.absoluteDifference;
+        if (result.checkedDifference > rule.failAboveAbsolute)
+            result.status = ComparisonStatus::Fail;
+        else if (result.checkedDifference > rule.warnAboveAbsolute)
+            result.status = ComparisonStatus::Warn;
+    }
+    else
+    {
+        result.checkedDifference = result.percentDeviation;
+        if (result.checkedDifference > rule.failAbovePercent)
+            result.status = ComparisonStatus::Fail;
+        else if (result.checkedDifference > rule.warnAbovePercent)
+            result.status = ComparisonStatus::Warn;
+    }
 
-    return percentageDeviation(originalValue, newValue, allowNearZeroFlowMismatch) <= tolerancePercent;
+    return result;
 }
 
 void addFailReason(std::vector<std::string>& failReasons, const std::string& reason)
@@ -1350,21 +1398,90 @@ void writeDeviation(std::ostream& output, double deviationPercent)
     output << formatDeviation(deviationPercent);
 }
 
+const char* toleranceQuantityName(ToleranceQuantity quantity)
+{
+    switch (quantity)
+    {
+    case ToleranceQuantity::Flow:
+        return "flow";
+    case ToleranceQuantity::Volume:
+        return "volume";
+    case ToleranceQuantity::Depth:
+        return "depth";
+    case ToleranceQuantity::WaterSurfaceProfile:
+        return "water_surface_profile";
+    case ToleranceQuantity::Velocity:
+        return "velocity";
+    case ToleranceQuantity::ContinuityError:
+        return "continuity_error";
+    case ToleranceQuantity::Time:
+        return "time";
+    case ToleranceQuantity::Count:
+        return "count";
+    case ToleranceQuantity::PercentPoint:
+        return "percent_point";
+    case ToleranceQuantity::FlowRegime:
+        return "flow_regime";
+    default:
+        return "unknown";
+    }
+}
+
+void writeToleranceRule(std::ostream& output, ToleranceQuantity quantity)
+{
+    const ToleranceRule rule = defaultToleranceRule(quantity);
+    output << "  "
+        << std::left << std::setw(24) << toleranceQuantityName(quantity)
+        << "warn_percent=" << std::setw(10) << rule.warnAbovePercent
+        << "fail_percent=" << std::setw(10) << rule.failAbovePercent
+        << "warn_absolute=" << std::setw(12) << rule.warnAboveAbsolute
+        << "fail_absolute=" << std::setw(12) << rule.failAboveAbsolute
+        << "near_zero=" << std::setw(12) << rule.nearZeroThreshold
+        << "absolute_always=" << std::setw(6) << (rule.useAbsoluteAlways ? "true" : "false")
+        << "absolute_below_near_zero=" << (rule.useAbsoluteBelowNearZero ? "true" : "false")
+        << "\n";
+}
+
+void writeToleranceOverview(std::ostream& output)
+{
+    output << "Tolerance settings used\n";
+    output << "-----------------------\n";
+    writeToleranceRule(output, ToleranceQuantity::Flow);
+    writeToleranceRule(output, ToleranceQuantity::Volume);
+    writeToleranceRule(output, ToleranceQuantity::Depth);
+    writeToleranceRule(output, ToleranceQuantity::WaterSurfaceProfile);
+    writeToleranceRule(output, ToleranceQuantity::Velocity);
+    writeToleranceRule(output, ToleranceQuantity::ContinuityError);
+    writeToleranceRule(output, ToleranceQuantity::Time);
+    writeToleranceRule(output, ToleranceQuantity::Count);
+    writeToleranceRule(output, ToleranceQuantity::PercentPoint);
+    writeToleranceRule(output, ToleranceQuantity::FlowRegime);
+    output << "\n";
+}
+
 void writeTimeSeriesComparisonRow(
     std::ostream& detailReport,
     const std::string& name,
-    bool passed,
+    ComparisonStatus status,
+    int warnedValues,
     int failedValues,
-    double maxDeviation,
+    double maxCheckedDifference,
+    double maxPercentDeviation,
+    double maxAbsoluteDifference,
+    const std::string& maxDifferenceMode,
     const std::string& maxDeviationTime,
     double originalValueAtMaxDeviation,
     double newValueAtMaxDeviation)
 {
     detailReport << "  "
         << std::left << std::setw(36) << name
-        << std::setw(8) << (passed ? "PASS" : "FAIL")
+        << std::setw(8) << comparisonStatusText(status)
+        << "warned_values=" << std::right << std::setw(8) << warnedValues << "  "
         << "failed_values=" << std::right << std::setw(8) << failedValues << "  "
-        << "max_deviation_percent=" << std::right << std::setw(14) << formatDeviation(maxDeviation) << "  "
+        << "max_checked_difference=" << std::right << std::setw(14) << formatDeviation(maxCheckedDifference) << "  "
+        << "mode=" << std::left << std::setw(8) << maxDifferenceMode
+        << "max_deviation_percent=" << std::right << std::setw(14) << formatDeviation(maxPercentDeviation) << "  "
+        << "max_absolute_difference=" << std::right << std::setw(14) << maxAbsoluteDifference << "  "
         << "at=" << maxDeviationTime << "  "
         << "original_at_max=" << std::setw(14) << originalValueAtMaxDeviation << "  "
         << "new_at_max=" << std::setw(14) << newValueAtMaxDeviation << "\n"
@@ -1375,10 +1492,10 @@ struct TimeSeriesVariableComparisonSpec
 {
     int index = 0;
     const char* name = "";
-    double tolerancePercent = 0.0;
+    ToleranceQuantity quantity = ToleranceQuantity::Flow;
 };
 
-bool compareTimeSeriesVariables(
+ComparisonStatus compareTimeSeriesVariables(
     const std::string& sectionTitle,
     const TimeSeriesResultRecord& originalRecord,
     const TimeSeriesResultRecord& newRecord,
@@ -1387,18 +1504,23 @@ bool compareTimeSeriesVariables(
     std::vector<std::string>& failReasons,
     const std::string& elementTypeForReason)
 {
-    bool passed = true;
+    ComparisonStatus aggregateStatus = ComparisonStatus::Pass;
 
     detailReport << "\n" << sectionTitle << ": " << originalRecord.id << "\n";
 
     for (const TimeSeriesVariableComparisonSpec& spec : specs)
     {
-        bool variablePassed = true;
+        ComparisonStatus variableStatus = ComparisonStatus::Pass;
+        int warnedValues = 0;
         int failedValues = 0;
-        double maxDeviation = 0.0;
+        double maxCheckedDifference = 0.0;
+        double maxPercentDeviation = 0.0;
+        double maxAbsoluteDifference = 0.0;
         size_t maxDeviationPeriod = 0;
         double originalValueAtMaxDeviation = 0.0;
         double newValueAtMaxDeviation = 0.0;
+        std::string maxDifferenceMode = "percent";
+        const ToleranceRule rule = defaultToleranceRule(spec.quantity);
 
         for (size_t period = 0; period < originalRecord.values.size(); ++period)
         {
@@ -1408,35 +1530,43 @@ bool compareTimeSeriesVariables(
             if (originalValues.size() <= static_cast<size_t>(spec.index) ||
                 newValues.size() <= static_cast<size_t>(spec.index))
             {
-                variablePassed = false;
+                variableStatus = ComparisonStatus::Fail;
                 ++failedValues;
                 continue;
             }
 
             const double originalValue = originalValues[spec.index];
             const double newValue = newValues[spec.index];
-            const double deviation = percentageDeviation(originalValue, newValue, true);
-            const bool valuePassed =
-                percentageValuePasses(originalValue, newValue, spec.tolerancePercent, true);
+            const ValueComparisonResult valueResult =
+                compareValuesWithTolerance(originalValue, newValue, rule);
 
-            if (deviation > maxDeviation)
+            if (valueResult.checkedDifference > maxCheckedDifference)
             {
-                maxDeviation = deviation;
+                maxCheckedDifference = valueResult.checkedDifference;
+                maxPercentDeviation = valueResult.percentDeviation;
+                maxAbsoluteDifference = valueResult.absoluteDifference;
                 maxDeviationPeriod = period;
                 originalValueAtMaxDeviation = originalValue;
                 newValueAtMaxDeviation = newValue;
+                maxDifferenceMode = valueResult.usedAbsolute ? "absolute" : "percent";
             }
 
-            if (!valuePassed)
+            if (valueResult.status == ComparisonStatus::Fail)
             {
-                variablePassed = false;
                 ++failedValues;
             }
+            else if (valueResult.status == ComparisonStatus::Warn)
+            {
+                ++warnedValues;
+            }
+
+            combineStatus(variableStatus, valueResult.status);
         }
 
-        if (!variablePassed)
+        combineStatus(aggregateStatus, variableStatus);
+
+        if (variableStatus == ComparisonStatus::Fail)
         {
-            passed = false;
             addFailReason(
                 failReasons,
                 "FAIL time-step " + elementTypeForReason + " " + spec.name);
@@ -1448,35 +1578,44 @@ bool compareTimeSeriesVariables(
         writeTimeSeriesComparisonRow(
             detailReport,
             spec.name,
-            variablePassed,
+            variableStatus,
+            warnedValues,
             failedValues,
-            maxDeviation,
+            maxCheckedDifference,
+            maxPercentDeviation,
+            maxAbsoluteDifference,
+            maxDifferenceMode,
             maxDeviationTime,
             originalValueAtMaxDeviation,
             newValueAtMaxDeviation);
     }
 
-    return passed;
+    return aggregateStatus;
 }
 
-bool compareSubcatchmentTimeSeries(
+ComparisonStatus compareSubcatchmentTimeSeries(
     const TimeSeriesResultRecord& originalRecord,
     const TimeSeriesResultRecord& newRecord,
     std::ostream& detailReport,
     std::vector<std::string>& failReasons)
 {
-    bool passed = true;
+    ComparisonStatus aggregateStatus = ComparisonStatus::Pass;
 
     detailReport << "\nSubcatchment: " << originalRecord.id << "\n";
 
     for (const SubcatchVariableComparisonSpec& spec : subcatchVariableComparisonSpecs())
     {
-        bool variablePassed = true;
+        ComparisonStatus variableStatus = ComparisonStatus::Pass;
+        int warnedValues = 0;
         int failedValues = 0;
-        double maxDeviation = 0.0;
+        double maxCheckedDifference = 0.0;
+        double maxPercentDeviation = 0.0;
+        double maxAbsoluteDifference = 0.0;
         size_t maxDeviationPeriod = 0;
         double originalValueAtMaxDeviation = 0.0;
         double newValueAtMaxDeviation = 0.0;
+        std::string maxDifferenceMode = spec.requireExactMatch ? "exact" : "percent";
+        const ToleranceRule rule = defaultToleranceRule(spec.quantity);
 
         for (size_t period = 0; period < originalRecord.values.size(); ++period)
         {
@@ -1486,45 +1625,56 @@ bool compareSubcatchmentTimeSeries(
             if (originalValues.size() <= static_cast<size_t>(spec.index) ||
                 newValues.size() <= static_cast<size_t>(spec.index))
             {
-                variablePassed = false;
+                variableStatus = ComparisonStatus::Fail;
                 ++failedValues;
                 continue;
             }
 
             const double originalValue = originalValues[spec.index];
             const double newValue = newValues[spec.index];
-            bool valuePassed = false;
-            double deviation = 0.0;
+            ValueComparisonResult valueResult;
 
             if (spec.requireExactMatch)
             {
-                valuePassed = originalValue == newValue;
-                deviation = originalValue == newValue ? 0.0 : percentageDeviation(originalValue, newValue);
+                valueResult.absoluteDifference = std::fabs(newValue - originalValue);
+                valueResult.percentDeviation = percentageDeviation(originalValue, newValue);
+                valueResult.checkedDifference = valueResult.absoluteDifference;
+                valueResult.usedAbsolute = true;
+                valueResult.status = originalValue == newValue ?
+                    ComparisonStatus::Pass : ComparisonStatus::Fail;
             }
             else
             {
-                deviation = percentageDeviation(originalValue, newValue, true);
-                valuePassed = percentageValuePasses(originalValue, newValue, spec.tolerancePercent, true);
+                valueResult = compareValuesWithTolerance(originalValue, newValue, rule);
             }
 
-            if (deviation > maxDeviation)
+            if (valueResult.checkedDifference > maxCheckedDifference)
             {
-                maxDeviation = deviation;
+                maxCheckedDifference = valueResult.checkedDifference;
+                maxPercentDeviation = valueResult.percentDeviation;
+                maxAbsoluteDifference = valueResult.absoluteDifference;
                 maxDeviationPeriod = period;
                 originalValueAtMaxDeviation = originalValue;
                 newValueAtMaxDeviation = newValue;
+                maxDifferenceMode = valueResult.usedAbsolute ? "absolute" : "percent";
             }
 
-            if (!valuePassed)
+            if (valueResult.status == ComparisonStatus::Fail)
             {
-                variablePassed = false;
                 ++failedValues;
             }
+            else if (valueResult.status == ComparisonStatus::Warn)
+            {
+                ++warnedValues;
+            }
+
+            combineStatus(variableStatus, valueResult.status);
         }
 
-        if (!variablePassed)
+        combineStatus(aggregateStatus, variableStatus);
+
+        if (variableStatus == ComparisonStatus::Fail)
         {
-            passed = false;
             addFailReason(
                 failReasons,
                 std::string("FAIL time-step subcatchment ") + spec.name);
@@ -1536,48 +1686,56 @@ bool compareSubcatchmentTimeSeries(
         writeTimeSeriesComparisonRow(
             detailReport,
             spec.name,
-            variablePassed,
+            variableStatus,
+            warnedValues,
             failedValues,
-            maxDeviation,
+            maxCheckedDifference,
+            maxPercentDeviation,
+            maxAbsoluteDifference,
+            maxDifferenceMode,
             maxDeviationTime,
             originalValueAtMaxDeviation,
             newValueAtMaxDeviation);
     }
 
-    return passed;
+    return aggregateStatus;
 }
 
-bool compareSubcatchmentSummaries(
+struct SummaryComparisonSpec
+{
+    const char* name;
+    double originalValue;
+    double newValue;
+    ToleranceQuantity quantity;
+};
+
+ComparisonStatus compareSubcatchmentSummaries(
     const std::string& id,
     const SubcatchAnnualRunoffSummary& originalSummary,
     const SubcatchAnnualRunoffSummary& newSummary,
     std::ostream& detailReport,
     std::vector<std::string>& failReasons)
 {
-    struct SummarySpec
+    const SummaryComparisonSpec specs[] =
     {
-        const char* name;
-        double originalValue;
-        double newValue;
+        { "annual_impervious_runoff", originalSummary.imperviousRunoff, newSummary.imperviousRunoff, ToleranceQuantity::Volume },
+        { "annual_pervious_runoff", originalSummary.perviousRunoff, newSummary.perviousRunoff, ToleranceQuantity::Volume },
+        { "annual_total_runoff", originalSummary.totalRunoff, newSummary.totalRunoff, ToleranceQuantity::Volume }
     };
 
-    const SummarySpec specs[] =
-    {
-        { "annual_impervious_runoff", originalSummary.imperviousRunoff, newSummary.imperviousRunoff },
-        { "annual_pervious_runoff", originalSummary.perviousRunoff, newSummary.perviousRunoff },
-        { "annual_total_runoff", originalSummary.totalRunoff, newSummary.totalRunoff }
-    };
-
-    bool passed = true;
+    ComparisonStatus aggregateStatus = ComparisonStatus::Pass;
 
     detailReport << "\nSubcatchment summary: " << id << "\n";
-    for (const SummarySpec& spec : specs)
+    for (const SummaryComparisonSpec& spec : specs)
     {
-        const double deviation = percentageDeviation(spec.originalValue, spec.newValue, true);
-        const bool valuePassed = percentageValuePasses(spec.originalValue, spec.newValue, 2.0, true);
-        if (!valuePassed)
+        const ValueComparisonResult valueResult =
+            compareValuesWithTolerance(
+                spec.originalValue,
+                spec.newValue,
+                defaultToleranceRule(spec.quantity));
+        combineStatus(aggregateStatus, valueResult.status);
+        if (valueResult.status == ComparisonStatus::Fail)
         {
-            passed = false;
             addFailReason(
                 failReasons,
                 std::string("FAIL summary subcatchment ") + spec.name);
@@ -1585,58 +1743,64 @@ bool compareSubcatchmentSummaries(
 
         detailReport << "  "
             << std::left << std::setw(36) << spec.name
-            << std::setw(8) << (valuePassed ? "PASS" : "FAIL")
+            << std::setw(8) << comparisonStatusText(valueResult.status)
             << "original=" << std::setw(14) << spec.originalValue
             << "new=" << std::setw(14) << spec.newValue
-            << "deviation_percent=";
-        writeDeviation(detailReport, deviation);
-        detailReport << "\n";
+            << "checked_difference=" << std::setw(14) << formatDeviation(valueResult.checkedDifference)
+            << "mode=" << std::setw(10) << (valueResult.usedAbsolute ? "absolute" : "percent")
+            << "deviation_percent=" << std::setw(14) << formatDeviation(valueResult.percentDeviation)
+            << "absolute_difference=" << std::setw(14) << valueResult.absoluteDifference
+            << "\n";
     }
 
-    return passed;
+    return aggregateStatus;
 }
 
 template <typename Summary>
-bool compareSummaryValues(
+ComparisonStatus compareSummaryValues(
     const std::string& sectionTitle,
     const std::string& id,
     const Summary& originalSummary,
     const Summary& newSummary,
-    const std::vector<std::pair<const char*, std::pair<double, double>>>& values,
+    const std::vector<SummaryComparisonSpec>& values,
     std::ostream& detailReport,
     std::vector<std::string>& failReasons,
     const std::string& elementTypeForReason)
 {
-    bool passed = true;
+    ComparisonStatus aggregateStatus = ComparisonStatus::Pass;
 
     detailReport << "\n" << sectionTitle << ": " << id << "\n";
-    for (const auto& [name, originalAndNew] : values)
+    for (const SummaryComparisonSpec& value : values)
     {
-        const double originalValue = originalAndNew.first;
-        const double newValue = originalAndNew.second;
-        const double deviation = percentageDeviation(originalValue, newValue, true);
-        const bool valuePassed = percentageValuePasses(originalValue, newValue, 2.0, true);
-        if (!valuePassed)
+        const ValueComparisonResult valueResult =
+            compareValuesWithTolerance(
+                value.originalValue,
+                value.newValue,
+                defaultToleranceRule(value.quantity));
+        combineStatus(aggregateStatus, valueResult.status);
+        if (valueResult.status == ComparisonStatus::Fail)
         {
-            passed = false;
             addFailReason(
                 failReasons,
-                "FAIL summary " + elementTypeForReason + " " + name);
+                "FAIL summary " + elementTypeForReason + " " + value.name);
         }
 
         detailReport << "  "
-            << std::left << std::setw(36) << name
-            << std::setw(8) << (valuePassed ? "PASS" : "FAIL")
-            << "original=" << std::setw(14) << originalValue
-            << "new=" << std::setw(14) << newValue
-            << "deviation_percent=" << std::setw(14) << formatDeviation(deviation)
+            << std::left << std::setw(36) << value.name
+            << std::setw(8) << comparisonStatusText(valueResult.status)
+            << "original=" << std::setw(14) << value.originalValue
+            << "new=" << std::setw(14) << value.newValue
+            << "checked_difference=" << std::setw(14) << formatDeviation(valueResult.checkedDifference)
+            << "mode=" << std::setw(10) << (valueResult.usedAbsolute ? "absolute" : "percent")
+            << "deviation_percent=" << std::setw(14) << formatDeviation(valueResult.percentDeviation)
+            << "absolute_difference=" << std::setw(14) << valueResult.absoluteDifference
             << "\n";
     }
 
-    return passed;
+    return aggregateStatus;
 }
 
-bool compareHydrologyNodeSummary(
+ComparisonStatus compareHydrologyNodeSummary(
     const std::string& id,
     const HydrologyNodeSummary& originalSummary,
     const HydrologyNodeSummary& newSummary,
@@ -1648,13 +1812,13 @@ bool compareHydrologyNodeSummary(
         id,
         originalSummary,
         newSummary,
-        { { "total_inflow_volume", { originalSummary.totalInflowVolume, newSummary.totalInflowVolume } } },
+        { { "total_inflow_volume", originalSummary.totalInflowVolume, newSummary.totalInflowVolume, ToleranceQuantity::Volume } },
         detailReport,
         failReasons,
         "hydrology node");
 }
 
-bool compareHydrologyLinkSummary(
+ComparisonStatus compareHydrologyLinkSummary(
     const std::string& id,
     const HydrologyLinkSummary& originalSummary,
     const HydrologyLinkSummary& newSummary,
@@ -1667,15 +1831,15 @@ bool compareHydrologyLinkSummary(
         originalSummary,
         newSummary,
         {
-            { "total_inflow_volume", { originalSummary.totalInflowVolume, newSummary.totalInflowVolume } },
-            { "total_outflow_volume", { originalSummary.totalOutflowVolume, newSummary.totalOutflowVolume } }
+            { "total_inflow_volume", originalSummary.totalInflowVolume, newSummary.totalInflowVolume, ToleranceQuantity::Volume },
+            { "total_outflow_volume", originalSummary.totalOutflowVolume, newSummary.totalOutflowVolume, ToleranceQuantity::Volume }
         },
         detailReport,
         failReasons,
         "hydrology link");
 }
 
-bool compareHydrologyWSUDSummary(
+ComparisonStatus compareHydrologyWSUDSummary(
     const std::string& id,
     const HydrologyWSUDSummary& originalSummary,
     const HydrologyWSUDSummary& newSummary,
@@ -1688,26 +1852,26 @@ bool compareHydrologyWSUDSummary(
         originalSummary,
         newSummary,
         {
-            { "volume_inflow", { originalSummary.volumeInflow, newSummary.volumeInflow } },
-            { "volume_lost_from_system", { originalSummary.volumeLostFromSystem, newSummary.volumeLostFromSystem } },
-            { "volume_network_outflow", { originalSummary.volumeNetworkOutflow, newSummary.volumeNetworkOutflow } },
-            { "volume_withdrawn", { originalSummary.volumeWithdrawn, newSummary.volumeWithdrawn } },
-            { "volume_requested", { originalSummary.volumeRequested, newSummary.volumeRequested } },
-            { "volume_low_flow_bypass", { originalSummary.volumeLowFlowBypass, newSummary.volumeLowFlowBypass } },
-            { "volume_high_flow_bypass", { originalSummary.volumeHighFlowBypass, newSummary.volumeHighFlowBypass } },
-            { "volume_evaporation", { originalSummary.volumeEvaporation, newSummary.volumeEvaporation } },
-            { "volume_exfiltration", { originalSummary.volumeExfiltration, newSummary.volumeExfiltration } },
-            { "volume_treated_flow", { originalSummary.volumeTreatedFlow, newSummary.volumeTreatedFlow } },
-            { "volume_overflow", { originalSummary.volumeOverflow, newSummary.volumeOverflow } },
-            { "treatment_train_source_flow", { originalSummary.treatmentTrainSourceFlow, newSummary.treatmentTrainSourceFlow } },
-            { "treatment_train_residual_flow", { originalSummary.treatmentTrainResidualFlow, newSummary.treatmentTrainResidualFlow } }
+            { "volume_inflow", originalSummary.volumeInflow, newSummary.volumeInflow, ToleranceQuantity::Volume },
+            { "volume_lost_from_system", originalSummary.volumeLostFromSystem, newSummary.volumeLostFromSystem, ToleranceQuantity::Volume },
+            { "volume_network_outflow", originalSummary.volumeNetworkOutflow, newSummary.volumeNetworkOutflow, ToleranceQuantity::Volume },
+            { "volume_withdrawn", originalSummary.volumeWithdrawn, newSummary.volumeWithdrawn, ToleranceQuantity::Volume },
+            { "volume_requested", originalSummary.volumeRequested, newSummary.volumeRequested, ToleranceQuantity::Volume },
+            { "volume_low_flow_bypass", originalSummary.volumeLowFlowBypass, newSummary.volumeLowFlowBypass, ToleranceQuantity::Volume },
+            { "volume_high_flow_bypass", originalSummary.volumeHighFlowBypass, newSummary.volumeHighFlowBypass, ToleranceQuantity::Volume },
+            { "volume_evaporation", originalSummary.volumeEvaporation, newSummary.volumeEvaporation, ToleranceQuantity::Volume },
+            { "volume_exfiltration", originalSummary.volumeExfiltration, newSummary.volumeExfiltration, ToleranceQuantity::Volume },
+            { "volume_treated_flow", originalSummary.volumeTreatedFlow, newSummary.volumeTreatedFlow, ToleranceQuantity::Volume },
+            { "volume_overflow", originalSummary.volumeOverflow, newSummary.volumeOverflow, ToleranceQuantity::Volume },
+            { "treatment_train_source_flow", originalSummary.treatmentTrainSourceFlow, newSummary.treatmentTrainSourceFlow, ToleranceQuantity::Volume },
+            { "treatment_train_residual_flow", originalSummary.treatmentTrainResidualFlow, newSummary.treatmentTrainResidualFlow, ToleranceQuantity::Volume }
         },
         detailReport,
         failReasons,
         "hydrology WSUD");
 }
 
-bool compareHydraulicNodeSummary(
+ComparisonStatus compareHydraulicNodeSummary(
     const std::string& id,
     const HydraulicNodeSummary& originalSummary,
     const HydraulicNodeSummary& newSummary,
@@ -1720,21 +1884,21 @@ bool compareHydraulicNodeSummary(
         originalSummary,
         newSummary,
         {
-            { "avg_depth", { originalSummary.avgDepth, newSummary.avgDepth } },
-            { "max_depth", { originalSummary.maxDepth, newSummary.maxDepth } },
-            { "max_lateral_flow", { originalSummary.maxLatFlow, newSummary.maxLatFlow } },
-            { "max_inflow", { originalSummary.maxInflow, newSummary.maxInflow } },
-            { "total_lateral_flow", { originalSummary.totalLatFlow, newSummary.totalLatFlow } },
-            { "total_inflow", { originalSummary.totalInflow, newSummary.totalInflow } },
-            { "continuity_error", { originalSummary.continuityError, newSummary.continuityError } },
-            { "volume_flooded", { originalSummary.volumeFlooded, newSummary.volumeFlooded } }
+            { "avg_depth", originalSummary.avgDepth, newSummary.avgDepth, ToleranceQuantity::Depth },
+            { "max_depth", originalSummary.maxDepth, newSummary.maxDepth, ToleranceQuantity::Depth },
+            { "max_lateral_flow", originalSummary.maxLatFlow, newSummary.maxLatFlow, ToleranceQuantity::Flow },
+            { "max_inflow", originalSummary.maxInflow, newSummary.maxInflow, ToleranceQuantity::Flow },
+            { "total_lateral_flow", originalSummary.totalLatFlow, newSummary.totalLatFlow, ToleranceQuantity::Volume },
+            { "total_inflow", originalSummary.totalInflow, newSummary.totalInflow, ToleranceQuantity::Volume },
+            { "continuity_error", originalSummary.continuityError, newSummary.continuityError, ToleranceQuantity::ContinuityError },
+            { "volume_flooded", originalSummary.volumeFlooded, newSummary.volumeFlooded, ToleranceQuantity::Volume }
         },
         detailReport,
         failReasons,
         "hydraulic node");
 }
 
-bool compareHydraulicLinkSummary(
+ComparisonStatus compareHydraulicLinkSummary(
     const std::string& id,
     const HydraulicLinkSummary& originalSummary,
     const HydraulicLinkSummary& newSummary,
@@ -1747,16 +1911,16 @@ bool compareHydraulicLinkSummary(
         originalSummary,
         newSummary,
         {
-            { "max_flow", { originalSummary.maxFlow, newSummary.maxFlow } },
-            { "max_velocity", { originalSummary.maxVelocity, newSummary.maxVelocity } },
-            { "max_flow_ratio", { originalSummary.maxFlowRatio, newSummary.maxFlowRatio } }
+            { "max_flow", originalSummary.maxFlow, newSummary.maxFlow, ToleranceQuantity::Flow },
+            { "max_velocity", originalSummary.maxVelocity, newSummary.maxVelocity, ToleranceQuantity::Velocity },
+            { "max_flow_ratio", originalSummary.maxFlowRatio, newSummary.maxFlowRatio, ToleranceQuantity::PercentPoint }
         },
         detailReport,
         failReasons,
         "hydraulic link");
 }
 
-bool compareRecordCollections(
+ComparisonStatus compareRecordCollections(
     const std::string& elementTypeName,
     const std::string& sectionTitle,
     const std::vector<TimeSeriesResultRecord>& originalRecords,
@@ -1766,7 +1930,7 @@ bool compareRecordCollections(
     std::ostream& detailReport,
     std::vector<std::string>& failReasons)
 {
-    bool passed = true;
+    ComparisonStatus aggregateStatus = ComparisonStatus::Pass;
 
     detailReport << "\nOriginal " << elementTypeName << " count: "
         << originalRecords.size() << "\n";
@@ -1784,7 +1948,7 @@ bool compareRecordCollections(
         addFailReason(
             failReasons,
             "element count mismatch for " + elementTypeName);
-        passed = false;
+        aggregateStatus = ComparisonStatus::Fail;
     }
 
     const std::map<std::string, size_t> originalIndex = buildRecordIndex(originalRecords);
@@ -1800,7 +1964,7 @@ bool compareRecordCollections(
                 failReasons,
                 "element in the original regression model found that is not in the newly created: " +
                     elementTypeName + " " + id);
-            passed = false;
+            aggregateStatus = ComparisonStatus::Fail;
         }
     }
 
@@ -1810,12 +1974,12 @@ bool compareRecordCollections(
         {
             detailReport << "FAIL: Newly created " << elementTypeName
                 << " ID not found in original regression file: " << id << "\n";
-            passed = false;
+            aggregateStatus = ComparisonStatus::Fail;
         }
     }
 
     if (!periodsMatch)
-        return false;
+        return ComparisonStatus::Fail;
 
     for (const auto& [id, originalRecordIndex] : originalIndex)
     {
@@ -1839,27 +2003,26 @@ bool compareRecordCollections(
                 addFailReason(
                     failReasons,
                     "time-step timestamp not aligned for " + elementTypeName);
-                passed = false;
+                aggregateStatus = ComparisonStatus::Fail;
             }
         }
 
-        if (!compareTimeSeriesVariables(
+        combineStatus(
+            aggregateStatus,
+            compareTimeSeriesVariables(
             sectionTitle,
             originalRecord,
             newRecord,
             specs,
             detailReport,
             failReasons,
-            elementTypeName))
-        {
-            passed = false;
-        }
+            elementTypeName));
     }
 
-    return passed;
+    return aggregateStatus;
 }
 
-bool compareSubcatchmentsForModel(
+ComparisonStatus compareSubcatchmentsForModel(
     const std::string& modelName,
     const fs::path& originalRunoffBinary,
     const fs::path& newRunoffBinary,
@@ -1873,40 +2036,41 @@ bool compareSubcatchmentsForModel(
     if (!detailReport)
         throw std::runtime_error("Could not create detailed comparison report: " + detailReportPath.string());
 
-    bool passed = true;
+    ComparisonStatus modelStatus = ComparisonStatus::Pass;
 
     detailReport << "Model: " << modelName << "\n";
     detailReport << "Original runoff binary: " << originalRunoffBinary << "\n";
     detailReport << "New runoff binary: " << newRunoffBinary << "\n\n";
     detailReport << "Original routing binary: " << originalRoutingBinary << "\n";
     detailReport << "New routing binary: " << newRoutingBinary << "\n\n";
+    writeToleranceOverview(detailReport);
 
     if (!fs::exists(originalRunoffBinary))
     {
         detailReport << "FAIL: Original runoff binary not found.\n";
         addFailReason(failReasons, "binaries of one of the models not found: original runoff");
-        return false;
+        return ComparisonStatus::Fail;
     }
 
     if (!fs::exists(newRunoffBinary))
     {
         detailReport << "FAIL: Newly created runoff binary not found.\n";
         addFailReason(failReasons, "binaries of one of the models not found: newly created runoff");
-        return false;
+        return ComparisonStatus::Fail;
     }
 
     if (!fs::exists(originalRoutingBinary))
     {
         detailReport << "FAIL: Original routing binary not found.\n";
         addFailReason(failReasons, "binaries of one of the models not found: original routing");
-        return false;
+        return ComparisonStatus::Fail;
     }
 
     if (!fs::exists(newRoutingBinary))
     {
         detailReport << "FAIL: Newly created routing binary not found.\n";
         addFailReason(failReasons, "binaries of one of the models not found: newly created routing");
-        return false;
+        return ComparisonStatus::Fail;
     }
 
     const RunoffBinaryResults originalResults = readRunoffBinaryResults(originalRunoffBinary);
@@ -1926,7 +2090,7 @@ bool compareSubcatchmentsForModel(
     {
         detailReport << "\nFAIL: Subcatchment counts do not match.\n";
         addFailReason(failReasons, "element count mismatch for subcatchment");
-        passed = false;
+        modelStatus = ComparisonStatus::Fail;
     }
 
     const std::map<std::string, size_t> originalIndex =
@@ -1943,7 +2107,7 @@ bool compareSubcatchmentsForModel(
             addFailReason(
                 failReasons,
                 "element in the original regression model found that is not in the newly created: subcatchment " + id);
-            passed = false;
+            modelStatus = ComparisonStatus::Fail;
         }
     }
 
@@ -1953,7 +2117,7 @@ bool compareSubcatchmentsForModel(
         {
             detailReport << "FAIL: Newly created subcatchment ID not found in original regression file: "
                 << id << "\n";
-            passed = false;
+            modelStatus = ComparisonStatus::Fail;
         }
     }
 
@@ -1972,7 +2136,7 @@ bool compareSubcatchmentsForModel(
     {
             detailReport << "FAIL: Nperiods do not match. Time-step value comparison skipped.\n";
         addFailReason(failReasons, "time-step (Nperiods) not aligned: runoff");
-        passed = false;
+        modelStatus = ComparisonStatus::Fail;
     }
 
     for (const auto& [id, originalRecordIndex] : originalIndex)
@@ -1999,41 +2163,41 @@ bool compareSubcatchmentsForModel(
                         << " new=" << (period < newRecord.times.size() ? formatDateTime(newRecord.times[period]) : "<missing>")
                         << "\n";
                     addFailReason(failReasons, "time-step timestamp not aligned for subcatchment");
-                    passed = false;
+                    modelStatus = ComparisonStatus::Fail;
                 }
             }
 
-            if (!compareSubcatchmentTimeSeries(originalRecord, newRecord, detailReport, failReasons))
-                passed = false;
+            combineStatus(
+                modelStatus,
+                compareSubcatchmentTimeSeries(originalRecord, newRecord, detailReport, failReasons));
         }
 
         if (originalRecordIndex < originalResults.subcatchmentSummaries.size() &&
             newRecordIndex->second < newResults.subcatchmentSummaries.size())
         {
-            if (!compareSubcatchmentSummaries(
+            combineStatus(
+                modelStatus,
+                compareSubcatchmentSummaries(
                 id,
                 originalResults.subcatchmentSummaries[originalRecordIndex],
                 newResults.subcatchmentSummaries[newRecordIndex->second],
                 detailReport,
-                failReasons))
-            {
-                passed = false;
-            }
+                failReasons));
         }
         else
         {
             detailReport << "FAIL: Missing subcatchment summary data for " << id << "\n";
             addFailReason(failReasons, "FAIL summary subcatchment missing data");
-            passed = false;
+            modelStatus = ComparisonStatus::Fail;
         }
     }
 
     const std::vector<TimeSeriesVariableComparisonSpec> hydrologyNodeSpecs =
     {
-        { 0, "FLOW", 5.0 }
+        { 0, "FLOW", ToleranceQuantity::Flow }
     };
 
-    if (!compareRecordCollections(
+    combineStatus(modelStatus, compareRecordCollections(
         "hydrology node",
         "Hydrology node",
         originalResults.hydrologyNodeRecords,
@@ -2041,10 +2205,7 @@ bool compareSubcatchmentsForModel(
         hydrologyNodeSpecs,
         periodsMatch,
         detailReport,
-        failReasons))
-    {
-        passed = false;
-    }
+        failReasons));
 
     const std::map<std::string, size_t> originalHydrologyNodeIndex =
         buildRecordIndex(originalResults.hydrologyNodeRecords);
@@ -2060,31 +2221,28 @@ bool compareSubcatchmentsForModel(
         if (originalRecordIndex < originalResults.hydrologyNodeSummaries.size() &&
             newRecordIndex->second < newResults.hydrologyNodeSummaries.size())
         {
-            if (!compareHydrologyNodeSummary(
+            combineStatus(modelStatus, compareHydrologyNodeSummary(
                 id,
                 originalResults.hydrologyNodeSummaries[originalRecordIndex],
                 newResults.hydrologyNodeSummaries[newRecordIndex->second],
                 detailReport,
-                failReasons))
-            {
-                passed = false;
-            }
+                failReasons));
         }
         else
         {
             detailReport << "FAIL: Missing hydrology node summary data for " << id << "\n";
             addFailReason(failReasons, "FAIL summary hydrology node missing data");
-            passed = false;
+            modelStatus = ComparisonStatus::Fail;
         }
     }
 
     const std::vector<TimeSeriesVariableComparisonSpec> hydrologyLinkSpecs =
     {
-        { 0, "INFLOW", 5.0 },
-        { 1, "OUTFLOW", 5.0 }
+        { 0, "INFLOW", ToleranceQuantity::Flow },
+        { 1, "OUTFLOW", ToleranceQuantity::Flow }
     };
 
-    if (!compareRecordCollections(
+    combineStatus(modelStatus, compareRecordCollections(
         "hydrology link",
         "Hydrology link",
         originalResults.hydrologyLinkRecords,
@@ -2092,10 +2250,7 @@ bool compareSubcatchmentsForModel(
         hydrologyLinkSpecs,
         periodsMatch,
         detailReport,
-        failReasons))
-    {
-        passed = false;
-    }
+        failReasons));
 
     const std::map<std::string, size_t> originalHydrologyLinkIndex =
         buildRecordIndex(originalResults.hydrologyLinkRecords);
@@ -2111,41 +2266,38 @@ bool compareSubcatchmentsForModel(
         if (originalRecordIndex < originalResults.hydrologyLinkSummaries.size() &&
             newRecordIndex->second < newResults.hydrologyLinkSummaries.size())
         {
-            if (!compareHydrologyLinkSummary(
+            combineStatus(modelStatus, compareHydrologyLinkSummary(
                 id,
                 originalResults.hydrologyLinkSummaries[originalRecordIndex],
                 newResults.hydrologyLinkSummaries[newRecordIndex->second],
                 detailReport,
-                failReasons))
-            {
-                passed = false;
-            }
+                failReasons));
         }
         else
         {
             detailReport << "FAIL: Missing hydrology link summary data for " << id << "\n";
             addFailReason(failReasons, "FAIL summary hydrology link missing data");
-            passed = false;
+            modelStatus = ComparisonStatus::Fail;
         }
     }
 
     const std::vector<TimeSeriesVariableComparisonSpec> hydrologyWSUDSpecs =
     {
-        { 0, "HYD_WSUD_DEPTH", 5.0 },
-        { 1, "HYD_WSUD_INFLOW", 5.0 },
-        { 2, "HYD_WSUD_TREATEDFLOW", 5.0 },
-        { 3, "HYD_WSUD_OVERFLOW", 5.0 },
-        { 4, "HYD_WSUD_LOWBYPASSFLOW", 5.0 },
-        { 5, "HYD_WSUD_HIGHBYPASSFLOW", 5.0 },
-        { 6, "HYD_WSUD_REUSEFLOW", 5.0 },
-        { 8, "HYD_WSUD_EVAPFLOW", 5.0 },
-        { 9, "HYD_WSUD_INFILFLOW", 5.0 },
-        { 10, "HYD_WSUD_STORAGE", 5.0 },
-        { 11, "HYD_WSUD_SOIL_THETA", 5.0 },
-        { 7, "HYD_WSUD_REQUESTED_DEMAND", 5.0 }
+        { 0, "HYD_WSUD_DEPTH", ToleranceQuantity::Depth },
+        { 1, "HYD_WSUD_INFLOW", ToleranceQuantity::Flow },
+        { 2, "HYD_WSUD_TREATEDFLOW", ToleranceQuantity::Flow },
+        { 3, "HYD_WSUD_OVERFLOW", ToleranceQuantity::Flow },
+        { 4, "HYD_WSUD_LOWBYPASSFLOW", ToleranceQuantity::Flow },
+        { 5, "HYD_WSUD_HIGHBYPASSFLOW", ToleranceQuantity::Flow },
+        { 6, "HYD_WSUD_REUSEFLOW", ToleranceQuantity::Flow },
+        { 8, "HYD_WSUD_EVAPFLOW", ToleranceQuantity::Flow },
+        { 9, "HYD_WSUD_INFILFLOW", ToleranceQuantity::Flow },
+        { 10, "HYD_WSUD_STORAGE", ToleranceQuantity::Volume },
+        { 11, "HYD_WSUD_SOIL_THETA", ToleranceQuantity::PercentPoint },
+        { 7, "HYD_WSUD_REQUESTED_DEMAND", ToleranceQuantity::Flow }
     };
 
-    if (!compareRecordCollections(
+    combineStatus(modelStatus, compareRecordCollections(
         "hydrology WSUD",
         "Hydrology WSUD",
         originalResults.hydrologyWSUDRecords,
@@ -2153,10 +2305,7 @@ bool compareSubcatchmentsForModel(
         hydrologyWSUDSpecs,
         periodsMatch,
         detailReport,
-        failReasons))
-    {
-        passed = false;
-    }
+        failReasons));
 
     const std::map<std::string, size_t> originalHydrologyWSUDIndex =
         buildRecordIndex(originalResults.hydrologyWSUDRecords);
@@ -2172,21 +2321,18 @@ bool compareSubcatchmentsForModel(
         if (originalRecordIndex < originalResults.hydrologyWSUDSummaries.size() &&
             newRecordIndex->second < newResults.hydrologyWSUDSummaries.size())
         {
-            if (!compareHydrologyWSUDSummary(
+            combineStatus(modelStatus, compareHydrologyWSUDSummary(
                 id,
                 originalResults.hydrologyWSUDSummaries[originalRecordIndex],
                 newResults.hydrologyWSUDSummaries[newRecordIndex->second],
                 detailReport,
-                failReasons))
-            {
-                passed = false;
-            }
+                failReasons));
         }
         else
         {
             detailReport << "FAIL: Missing hydrology WSUD summary data for " << id << "\n";
             addFailReason(failReasons, "FAIL summary hydrology WSUD missing data");
-            passed = false;
+            modelStatus = ComparisonStatus::Fail;
         }
     }
 
@@ -2199,19 +2345,19 @@ bool compareSubcatchmentsForModel(
     {
         detailReport << "FAIL: Routing Nperiods do not match. Hydraulic time-step value comparison skipped.\n";
         addFailReason(failReasons, "time-step (Nperiods) not aligned: routing");
-        passed = false;
+        modelStatus = ComparisonStatus::Fail;
     }
 
     const std::vector<TimeSeriesVariableComparisonSpec> hydraulicNodeSpecs =
     {
-        { 0, "DEPTH", 5.0 },
-        { 2, "VOLUME", 5.0 },
-        { 3, "LATERAL_FLOW", 5.0 },
-        { 4, "INFLOW", 5.0 },
-        { 5, "OVERFLOW", 5.0 }
+        { 0, "DEPTH", ToleranceQuantity::Depth },
+        { 2, "VOLUME", ToleranceQuantity::Volume },
+        { 3, "LATERAL_FLOW", ToleranceQuantity::Flow },
+        { 4, "INFLOW", ToleranceQuantity::Flow },
+        { 5, "OVERFLOW", ToleranceQuantity::Flow }
     };
 
-    if (!compareRecordCollections(
+    combineStatus(modelStatus, compareRecordCollections(
         "hydraulic node",
         "Hydraulic node",
         originalRoutingResults.hydraulicNodeRecords,
@@ -2219,10 +2365,7 @@ bool compareSubcatchmentsForModel(
         hydraulicNodeSpecs,
         routingPeriodsMatch,
         detailReport,
-        failReasons))
-    {
-        passed = false;
-    }
+        failReasons));
 
     const std::map<std::string, size_t> originalHydraulicNodeIndex =
         buildRecordIndex(originalRoutingResults.hydraulicNodeRecords);
@@ -2238,33 +2381,30 @@ bool compareSubcatchmentsForModel(
         if (originalRecordIndex < originalRoutingResults.hydraulicNodeSummaries.size() &&
             newRecordIndex->second < newRoutingResults.hydraulicNodeSummaries.size())
         {
-            if (!compareHydraulicNodeSummary(
+            combineStatus(modelStatus, compareHydraulicNodeSummary(
                 id,
                 originalRoutingResults.hydraulicNodeSummaries[originalRecordIndex],
                 newRoutingResults.hydraulicNodeSummaries[newRecordIndex->second],
                 detailReport,
-                failReasons))
-            {
-                passed = false;
-            }
+                failReasons));
         }
         else
         {
             detailReport << "FAIL: Missing hydraulic node summary data for " << id << "\n";
             addFailReason(failReasons, "FAIL summary hydraulic node missing data");
-            passed = false;
+            modelStatus = ComparisonStatus::Fail;
         }
     }
 
     const std::vector<TimeSeriesVariableComparisonSpec> hydraulicLinkSpecs =
     {
-        { 0, "FLOW", 5.0 },
-        { 1, "DEPTH", 5.0 },
-        { 2, "VELOCITY", 5.0 },
-        { 3, "VOLUME", 5.0 }
+        { 0, "FLOW", ToleranceQuantity::Flow },
+        { 1, "DEPTH", ToleranceQuantity::Depth },
+        { 2, "VELOCITY", ToleranceQuantity::Velocity },
+        { 3, "VOLUME", ToleranceQuantity::Volume }
     };
 
-    if (!compareRecordCollections(
+    combineStatus(modelStatus, compareRecordCollections(
         "hydraulic link",
         "Hydraulic link",
         originalRoutingResults.hydraulicLinkRecords,
@@ -2272,10 +2412,7 @@ bool compareSubcatchmentsForModel(
         hydraulicLinkSpecs,
         routingPeriodsMatch,
         detailReport,
-        failReasons))
-    {
-        passed = false;
-    }
+        failReasons));
 
     const std::map<std::string, size_t> originalHydraulicLinkIndex =
         buildRecordIndex(originalRoutingResults.hydraulicLinkRecords);
@@ -2291,26 +2428,23 @@ bool compareSubcatchmentsForModel(
         if (originalRecordIndex < originalRoutingResults.hydraulicLinkSummaries.size() &&
             newRecordIndex->second < newRoutingResults.hydraulicLinkSummaries.size())
         {
-            if (!compareHydraulicLinkSummary(
+            combineStatus(modelStatus, compareHydraulicLinkSummary(
                 id,
                 originalRoutingResults.hydraulicLinkSummaries[originalRecordIndex],
                 newRoutingResults.hydraulicLinkSummaries[newRecordIndex->second],
                 detailReport,
-                failReasons))
-            {
-                passed = false;
-            }
+                failReasons));
         }
         else
         {
             detailReport << "FAIL: Missing hydraulic link summary data for " << id << "\n";
             addFailReason(failReasons, "FAIL summary hydraulic link missing data");
-            passed = false;
+            modelStatus = ComparisonStatus::Fail;
         }
     }
 
-    detailReport << "\nModel result: " << (passed ? "PASS" : "FAIL") << "\n";
-    return passed;
+    detailReport << "\nModel result: " << comparisonStatusText(modelStatus) << "\n";
+    return modelStatus;
 }
 
 int compareSubcatchmentsForAllModels(
@@ -2353,11 +2487,11 @@ int compareSubcatchmentsForAllModels(
         const fs::path detailReportPath =
             newModelFolder / "comparison_result.txt";
 
-        bool modelPassed = false;
+        ComparisonStatus modelStatus = ComparisonStatus::Fail;
         std::vector<std::string> failReasons;
         try
         {
-            modelPassed = compareSubcatchmentsForModel(
+            modelStatus = compareSubcatchmentsForModel(
                 modelName,
                 originalRunoffBinary,
                 newRunoffBinary,
@@ -2378,16 +2512,16 @@ int compareSubcatchmentsForAllModels(
             }
             std::cerr << "WARNING: Subcatchment comparison failed for model '"
                 << modelName << "': " << e.what() << "\n";
-            modelPassed = false;
+            modelStatus = ComparisonStatus::Fail;
         }
 
-        if (!modelPassed)
+        if (modelStatus == ComparisonStatus::Fail)
             ++failedModels;
 
         mainReport << std::left << std::setw(mainReportModelWidth) << modelName
-            << std::setw(mainReportResultWidth) << (modelPassed ? "PASS" : "FAIL");
+            << std::setw(mainReportResultWidth) << comparisonStatusText(modelStatus);
 
-        if (modelPassed || failReasons.empty())
+        if (modelStatus != ComparisonStatus::Fail || failReasons.empty())
         {
             mainReport << "\n";
         }
