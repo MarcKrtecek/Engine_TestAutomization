@@ -2461,6 +2461,8 @@ int compareSubcatchmentsForAllModels(
     }
 
     int failedModels = 0;
+    int warnedModels = 0;
+    int passedModels = 0;
     constexpr int mainReportModelWidth = 32;
     constexpr int mainReportResultWidth = 8;
     mainReport << std::left << std::setw(mainReportModelWidth) << "Model"
@@ -2517,6 +2519,10 @@ int compareSubcatchmentsForAllModels(
 
         if (modelStatus == ComparisonStatus::Fail)
             ++failedModels;
+        else if (modelStatus == ComparisonStatus::Warn)
+            ++warnedModels;
+        else
+            ++passedModels;
 
         mainReport << std::left << std::setw(mainReportModelWidth) << modelName
             << std::setw(mainReportResultWidth) << comparisonStatusText(modelStatus);
@@ -2537,6 +2543,11 @@ int compareSubcatchmentsForAllModels(
         }
     }
 
+    std::cout << "\nComparison summary\n";
+    std::cout << "------------------\n";
+    std::cout << "Passed: " << passedModels << "\n";
+    std::cout << "Warned: " << warnedModels << "\n";
+    std::cout << "Failed: " << failedModels << "\n";
     std::cout << "Main comparison report: " << mainReportPath << "\n";
     return failedModels;
 }
@@ -2727,6 +2738,7 @@ int runEngine_onAllInputFiles(char* argv[], bool useDll)
 
     std::cout << "\nSummary\n";
     std::cout << "-------\n";
+    std::cout << "Engine runs\n";
     std::cout << "Passed: " << passedRuns << "\n";
     std::cout << "Failed: " << failedRuns << "\n";
 
