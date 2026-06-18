@@ -38,6 +38,20 @@ struct ToleranceRule
     bool useAbsoluteBelowNearZero = false;
 };
 
+struct ToleranceSettings
+{
+    ToleranceRule flow;
+    ToleranceRule volume;
+    ToleranceRule depth;
+    ToleranceRule waterSurfaceProfile;
+    ToleranceRule velocity;
+    ToleranceRule continuityError;
+    ToleranceRule time;
+    ToleranceRule count;
+    ToleranceRule percentPoint;
+    ToleranceRule flowRegime;
+};
+
 namespace DefaultTolerances
 {
     // Flow is stored and compared as m3/s. The document's 5 L/s near-zero
@@ -164,6 +178,23 @@ namespace DefaultTolerances
     };
 }
 
+inline constexpr ToleranceSettings defaultToleranceSettings()
+{
+    return
+    {
+        DefaultTolerances::Flow,
+        DefaultTolerances::Volume,
+        DefaultTolerances::Depth,
+        DefaultTolerances::WaterSurfaceProfile,
+        DefaultTolerances::Velocity,
+        DefaultTolerances::ContinuityError,
+        DefaultTolerances::Time,
+        DefaultTolerances::Count,
+        DefaultTolerances::PercentPoint,
+        DefaultTolerances::FlowRegime
+    };
+}
+
 inline constexpr ToleranceRule defaultToleranceRule(ToleranceQuantity quantity)
 {
     switch (quantity)
@@ -190,5 +221,36 @@ inline constexpr ToleranceRule defaultToleranceRule(ToleranceQuantity quantity)
         return DefaultTolerances::FlowRegime;
     default:
         return DefaultTolerances::Flow;
+    }
+}
+
+inline constexpr ToleranceRule toleranceRule(
+    const ToleranceSettings& settings,
+    ToleranceQuantity quantity)
+{
+    switch (quantity)
+    {
+    case ToleranceQuantity::Flow:
+        return settings.flow;
+    case ToleranceQuantity::Volume:
+        return settings.volume;
+    case ToleranceQuantity::Depth:
+        return settings.depth;
+    case ToleranceQuantity::WaterSurfaceProfile:
+        return settings.waterSurfaceProfile;
+    case ToleranceQuantity::Velocity:
+        return settings.velocity;
+    case ToleranceQuantity::ContinuityError:
+        return settings.continuityError;
+    case ToleranceQuantity::Time:
+        return settings.time;
+    case ToleranceQuantity::Count:
+        return settings.count;
+    case ToleranceQuantity::PercentPoint:
+        return settings.percentPoint;
+    case ToleranceQuantity::FlowRegime:
+        return settings.flowRegime;
+    default:
+        return settings.flow;
     }
 }

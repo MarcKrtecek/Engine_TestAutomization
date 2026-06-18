@@ -28,6 +28,7 @@
 #include <iomanip>
 #include <windows.h>
 #include <stdexcept>
+#include <cctype>
 
 #include "tolerances.h"
 
@@ -1413,6 +1414,190 @@ void writeDeviation(std::ostream& output, double deviationPercent)
     output << formatDeviation(deviationPercent);
 }
 
+std::string trim(const std::string& text)
+{
+    size_t first = 0;
+    while (first < text.size() && std::isspace(static_cast<unsigned char>(text[first])))
+        ++first;
+
+    size_t last = text.size();
+    while (last > first && std::isspace(static_cast<unsigned char>(text[last - 1])))
+        --last;
+
+    return text.substr(first, last - first);
+}
+
+std::string toLower(std::string text)
+{
+    std::transform(
+        text.begin(),
+        text.end(),
+        text.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return text;
+}
+
+bool parseBoolValue(const std::string& value)
+{
+    const std::string lowerValue = toLower(trim(value));
+    return lowerValue == "true" || lowerValue == "1" || lowerValue == "yes";
+}
+
+ToleranceRule* toleranceRuleForSection(ToleranceSettings& settings, const std::string& section)
+{
+    const std::string lowerSection = toLower(section);
+    if (lowerSection == "flow") return &settings.flow;
+    if (lowerSection == "volume") return &settings.volume;
+    if (lowerSection == "depth") return &settings.depth;
+    if (lowerSection == "water_surface_profile") return &settings.waterSurfaceProfile;
+    if (lowerSection == "velocity") return &settings.velocity;
+    if (lowerSection == "continuity_error") return &settings.continuityError;
+    if (lowerSection == "time") return &settings.time;
+    if (lowerSection == "count") return &settings.count;
+    if (lowerSection == "percent_point") return &settings.percentPoint;
+    if (lowerSection == "flow_regime") return &settings.flowRegime;
+    return nullptr;
+}
+
+const ToleranceRule* toleranceRuleForSection(
+    const ToleranceSettings& settings,
+    const std::string& section)
+{
+    const std::string lowerSection = toLower(section);
+    if (lowerSection == "flow") return &settings.flow;
+    if (lowerSection == "volume") return &settings.volume;
+    if (lowerSection == "depth") return &settings.depth;
+    if (lowerSection == "water_surface_profile") return &settings.waterSurfaceProfile;
+    if (lowerSection == "velocity") return &settings.velocity;
+    if (lowerSection == "continuity_error") return &settings.continuityError;
+    if (lowerSection == "time") return &settings.time;
+    if (lowerSection == "count") return &settings.count;
+    if (lowerSection == "percent_point") return &settings.percentPoint;
+    if (lowerSection == "flow_regime") return &settings.flowRegime;
+    return nullptr;
+}
+
+double toleranceRuleDoubleValue(const ToleranceRule& rule, const std::string& key)
+{
+    if (key == "warn_above_percent") return rule.warnAbovePercent;
+    if (key == "fail_above_percent") return rule.failAbovePercent;
+    if (key == "warn_above_absolute") return rule.warnAboveAbsolute;
+    if (key == "fail_above_absolute") return rule.failAboveAbsolute;
+    if (key == "near_zero_threshold") return rule.nearZeroThreshold;
+    throw std::runtime_error("Unknown numeric tolerance key: " + key);
+}
+
+bool toleranceRuleBoolValue(const ToleranceRule& rule, const std::string& key)
+{
+    if (key == "use_absolute_always") return rule.useAbsoluteAlways;
+    if (key == "use_absolute_below_near_zero") return rule.useAbsoluteBelowNearZero;
+    throw std::runtime_error("Unknown boolean tolerance key: " + key);
+}
+
+void setToleranceRuleValue(ToleranceRule& rule, const std::string& key, const std::string& value)
+{
+    if (key == "warn_above_percent")
+        rule.warnAbovePercent = std::stod(value);
+    else if (key == "fail_above_percent")
+        rule.failAbovePercent = std::stod(value);
+    else if (key == "warn_above_absolute")
+        rule.warnAboveAbsolute = std::stod(value);
+    else if (key == "fail_above_absolute")
+        rule.failAboveAbsolute = std::stod(value);
+    else if (key == "near_zero_threshold")
+        rule.nearZeroThreshold = std::stod(value);
+    else if (key == "use_absolute_always")
+        rule.useAbsoluteAlways = parseBoolValue(value);
+    else if (key == "use_absolute_below_near_zero")
+        rule.useAbsoluteBelowNearZero = parseBoolValue(value);
+    else
+        throw std::runtime_error("Unknown tolerance key: " + key);
+}
+
+bool doublesDiffer(double a, double b)
+{
+    return std::fabs(a - b) > 1.0e-12;
+}
+
+void addToleranceOverrideMessage(
+    std::vector<std::string>& messages,
+    const std::string& section,
+    const std::string& key,
+    const std::string& value)
+{
+    messages.push_back(
+        "Global setting for " + section + "/" + key +
+        " was overwritten by the ini file, the new setting is: " + value);
+}
+
+ToleranceSettings readToleranceSettingsForModel(
+    const fs::path& modelFolder,
+    std::vector<std::string>& overrideMessages)
+{
+    ToleranceSettings settings = defaultToleranceSettings();
+    const ToleranceSettings globalSettings = defaultToleranceSettings();
+    const fs::path toleranceIniPath = modelFolder / "tolerance.ini";
+    if (!fs::exists(toleranceIniPath))
+        return settings;
+
+    std::ifstream input(toleranceIniPath);
+    if (!input)
+        throw std::runtime_error("Could not open tolerance ini file: " + toleranceIniPath.string());
+
+    std::string currentSection;
+    std::string line;
+    int lineNumber = 0;
+    while (std::getline(input, line))
+    {
+        ++lineNumber;
+        const size_t commentPosition = line.find_first_of("#;");
+        if (commentPosition != std::string::npos)
+            line = line.substr(0, commentPosition);
+
+        line = trim(line);
+        if (line.empty())
+            continue;
+
+        if (line.front() == '[' && line.back() == ']')
+        {
+            currentSection = toLower(trim(line.substr(1, line.size() - 2)));
+            if (!toleranceRuleForSection(settings, currentSection))
+                throw std::runtime_error(
+                    "Unknown tolerance section in " + toleranceIniPath.string() +
+                    " at line " + std::to_string(lineNumber) + ": " + currentSection);
+            continue;
+        }
+
+        const size_t equalsPosition = line.find('=');
+        if (equalsPosition == std::string::npos || currentSection.empty())
+            throw std::runtime_error(
+                "Invalid tolerance ini line in " + toleranceIniPath.string() +
+                " at line " + std::to_string(lineNumber));
+
+        const std::string key = toLower(trim(line.substr(0, equalsPosition)));
+        const std::string value = trim(line.substr(equalsPosition + 1));
+        ToleranceRule* rule = toleranceRuleForSection(settings, currentSection);
+        const ToleranceRule* globalRule = toleranceRuleForSection(globalSettings, currentSection);
+        if (!rule || !globalRule)
+            throw std::runtime_error("Invalid tolerance section: " + currentSection);
+
+        setToleranceRuleValue(*rule, key, value);
+
+        if (key == "use_absolute_always" || key == "use_absolute_below_near_zero")
+        {
+            if (toleranceRuleBoolValue(*rule, key) != toleranceRuleBoolValue(*globalRule, key))
+                addToleranceOverrideMessage(overrideMessages, currentSection, key, value);
+        }
+        else
+        {
+            if (doublesDiffer(toleranceRuleDoubleValue(*rule, key), toleranceRuleDoubleValue(*globalRule, key)))
+                addToleranceOverrideMessage(overrideMessages, currentSection, key, value);
+        }
+    }
+
+    return settings;
+}
+
 const char* toleranceQuantityName(ToleranceQuantity quantity)
 {
     switch (quantity)
@@ -1442,9 +1627,12 @@ const char* toleranceQuantityName(ToleranceQuantity quantity)
     }
 }
 
-void writeToleranceRule(std::ostream& output, ToleranceQuantity quantity)
+void writeToleranceRule(
+    std::ostream& output,
+    const ToleranceSettings& settings,
+    ToleranceQuantity quantity)
 {
-    const ToleranceRule rule = defaultToleranceRule(quantity);
+    const ToleranceRule rule = toleranceRule(settings, quantity);
     output << "  "
         << std::left << std::setw(24) << toleranceQuantityName(quantity)
         << "warn_percent=" << std::setw(10) << rule.warnAbovePercent
@@ -1457,20 +1645,30 @@ void writeToleranceRule(std::ostream& output, ToleranceQuantity quantity)
         << "\n";
 }
 
-void writeToleranceOverview(std::ostream& output)
+void writeToleranceOverview(
+    std::ostream& output,
+    const ToleranceSettings& settings,
+    const std::vector<std::string>& overrideMessages)
 {
     output << "Tolerance settings used\n";
     output << "-----------------------\n";
-    writeToleranceRule(output, ToleranceQuantity::Flow);
-    writeToleranceRule(output, ToleranceQuantity::Volume);
-    writeToleranceRule(output, ToleranceQuantity::Depth);
-    writeToleranceRule(output, ToleranceQuantity::WaterSurfaceProfile);
-    writeToleranceRule(output, ToleranceQuantity::Velocity);
-    writeToleranceRule(output, ToleranceQuantity::ContinuityError);
-    writeToleranceRule(output, ToleranceQuantity::Time);
-    writeToleranceRule(output, ToleranceQuantity::Count);
-    writeToleranceRule(output, ToleranceQuantity::PercentPoint);
-    writeToleranceRule(output, ToleranceQuantity::FlowRegime);
+    writeToleranceRule(output, settings, ToleranceQuantity::Flow);
+    writeToleranceRule(output, settings, ToleranceQuantity::Volume);
+    writeToleranceRule(output, settings, ToleranceQuantity::Depth);
+    writeToleranceRule(output, settings, ToleranceQuantity::WaterSurfaceProfile);
+    writeToleranceRule(output, settings, ToleranceQuantity::Velocity);
+    writeToleranceRule(output, settings, ToleranceQuantity::ContinuityError);
+    writeToleranceRule(output, settings, ToleranceQuantity::Time);
+    writeToleranceRule(output, settings, ToleranceQuantity::Count);
+    writeToleranceRule(output, settings, ToleranceQuantity::PercentPoint);
+    writeToleranceRule(output, settings, ToleranceQuantity::FlowRegime);
+    if (!overrideMessages.empty())
+    {
+        output << "\nTolerance overrides\n";
+        output << "-------------------\n";
+        for (const std::string& message : overrideMessages)
+            output << message << "\n";
+    }
     output << "\n";
 }
 
@@ -1519,7 +1717,8 @@ ComparisonStatus compareTimeSeriesVariables(
     const std::vector<TimeSeriesVariableComparisonSpec>& specs,
     std::ostream& detailReport,
     std::vector<std::string>& failReasons,
-    const std::string& elementTypeForReason)
+    const std::string& elementTypeForReason,
+    const ToleranceSettings& toleranceSettings)
 {
     ComparisonStatus aggregateStatus = ComparisonStatus::Pass;
 
@@ -1540,7 +1739,7 @@ ComparisonStatus compareTimeSeriesVariables(
         std::string maxDifferenceMode = "percent";
         ComparisonStatus selectedDisplayStatus = ComparisonStatus::Pass;
         bool hasDisplayValue = false;
-        const ToleranceRule rule = defaultToleranceRule(spec.quantity);
+        const ToleranceRule rule = toleranceRule(toleranceSettings, spec.quantity);
 
         for (size_t period = 0; period < originalRecord.values.size(); ++period)
         {
@@ -1627,7 +1826,8 @@ ComparisonStatus compareSubcatchmentTimeSeries(
     const TimeSeriesResultRecord& originalRecord,
     const TimeSeriesResultRecord& newRecord,
     std::ostream& detailReport,
-    std::vector<std::string>& failReasons)
+    std::vector<std::string>& failReasons,
+    const ToleranceSettings& toleranceSettings)
 {
     ComparisonStatus aggregateStatus = ComparisonStatus::Pass;
 
@@ -1648,7 +1848,7 @@ ComparisonStatus compareSubcatchmentTimeSeries(
         std::string maxDifferenceMode = spec.requireExactMatch ? "exact" : "percent";
         ComparisonStatus selectedDisplayStatus = ComparisonStatus::Pass;
         bool hasDisplayValue = false;
-        const ToleranceRule rule = defaultToleranceRule(spec.quantity);
+        const ToleranceRule rule = toleranceRule(toleranceSettings, spec.quantity);
 
         for (size_t period = 0; period < originalRecord.values.size(); ++period)
         {
@@ -1757,7 +1957,8 @@ ComparisonStatus compareSubcatchmentSummaries(
     const SubcatchAnnualRunoffSummary& originalSummary,
     const SubcatchAnnualRunoffSummary& newSummary,
     std::ostream& detailReport,
-    std::vector<std::string>& failReasons)
+    std::vector<std::string>& failReasons,
+    const ToleranceSettings& toleranceSettings)
 {
     const SummaryComparisonSpec specs[] =
     {
@@ -1775,7 +1976,7 @@ ComparisonStatus compareSubcatchmentSummaries(
             compareValuesWithTolerance(
                 spec.originalValue,
                 spec.newValue,
-                defaultToleranceRule(spec.quantity));
+                toleranceRule(toleranceSettings, spec.quantity));
         combineStatus(aggregateStatus, valueResult.status);
         if (valueResult.status == ComparisonStatus::Fail)
         {
@@ -1808,7 +2009,8 @@ ComparisonStatus compareSummaryValues(
     const std::vector<SummaryComparisonSpec>& values,
     std::ostream& detailReport,
     std::vector<std::string>& failReasons,
-    const std::string& elementTypeForReason)
+    const std::string& elementTypeForReason,
+    const ToleranceSettings& toleranceSettings)
 {
     ComparisonStatus aggregateStatus = ComparisonStatus::Pass;
 
@@ -1819,7 +2021,7 @@ ComparisonStatus compareSummaryValues(
             compareValuesWithTolerance(
                 value.originalValue,
                 value.newValue,
-                defaultToleranceRule(value.quantity));
+                toleranceRule(toleranceSettings, value.quantity));
         combineStatus(aggregateStatus, valueResult.status);
         if (valueResult.status == ComparisonStatus::Fail)
         {
@@ -1848,7 +2050,8 @@ ComparisonStatus compareHydrologyNodeSummary(
     const HydrologyNodeSummary& originalSummary,
     const HydrologyNodeSummary& newSummary,
     std::ostream& detailReport,
-    std::vector<std::string>& failReasons)
+    std::vector<std::string>& failReasons,
+    const ToleranceSettings& toleranceSettings)
 {
     return compareSummaryValues(
         "Hydrology node summary",
@@ -1858,7 +2061,8 @@ ComparisonStatus compareHydrologyNodeSummary(
         { { "total_inflow_volume", originalSummary.totalInflowVolume, newSummary.totalInflowVolume, ToleranceQuantity::Volume } },
         detailReport,
         failReasons,
-        "hydrology node");
+        "hydrology node",
+        toleranceSettings);
 }
 
 ComparisonStatus compareHydrologyLinkSummary(
@@ -1866,7 +2070,8 @@ ComparisonStatus compareHydrologyLinkSummary(
     const HydrologyLinkSummary& originalSummary,
     const HydrologyLinkSummary& newSummary,
     std::ostream& detailReport,
-    std::vector<std::string>& failReasons)
+    std::vector<std::string>& failReasons,
+    const ToleranceSettings& toleranceSettings)
 {
     return compareSummaryValues(
         "Hydrology link summary",
@@ -1879,7 +2084,8 @@ ComparisonStatus compareHydrologyLinkSummary(
         },
         detailReport,
         failReasons,
-        "hydrology link");
+        "hydrology link",
+        toleranceSettings);
 }
 
 ComparisonStatus compareHydrologyWSUDSummary(
@@ -1887,7 +2093,8 @@ ComparisonStatus compareHydrologyWSUDSummary(
     const HydrologyWSUDSummary& originalSummary,
     const HydrologyWSUDSummary& newSummary,
     std::ostream& detailReport,
-    std::vector<std::string>& failReasons)
+    std::vector<std::string>& failReasons,
+    const ToleranceSettings& toleranceSettings)
 {
     return compareSummaryValues(
         "Hydrology WSUD summary",
@@ -1911,7 +2118,8 @@ ComparisonStatus compareHydrologyWSUDSummary(
         },
         detailReport,
         failReasons,
-        "hydrology WSUD");
+        "hydrology WSUD",
+        toleranceSettings);
 }
 
 ComparisonStatus compareHydraulicNodeSummary(
@@ -1919,7 +2127,8 @@ ComparisonStatus compareHydraulicNodeSummary(
     const HydraulicNodeSummary& originalSummary,
     const HydraulicNodeSummary& newSummary,
     std::ostream& detailReport,
-    std::vector<std::string>& failReasons)
+    std::vector<std::string>& failReasons,
+    const ToleranceSettings& toleranceSettings)
 {
     return compareSummaryValues(
         "Hydraulic node summary",
@@ -1938,7 +2147,8 @@ ComparisonStatus compareHydraulicNodeSummary(
         },
         detailReport,
         failReasons,
-        "hydraulic node");
+        "hydraulic node",
+        toleranceSettings);
 }
 
 ComparisonStatus compareHydraulicLinkSummary(
@@ -1946,7 +2156,8 @@ ComparisonStatus compareHydraulicLinkSummary(
     const HydraulicLinkSummary& originalSummary,
     const HydraulicLinkSummary& newSummary,
     std::ostream& detailReport,
-    std::vector<std::string>& failReasons)
+    std::vector<std::string>& failReasons,
+    const ToleranceSettings& toleranceSettings)
 {
     return compareSummaryValues(
         "Hydraulic link summary",
@@ -1960,7 +2171,8 @@ ComparisonStatus compareHydraulicLinkSummary(
         },
         detailReport,
         failReasons,
-        "hydraulic link");
+        "hydraulic link",
+        toleranceSettings);
 }
 
 ComparisonStatus compareRecordCollections(
@@ -1971,7 +2183,8 @@ ComparisonStatus compareRecordCollections(
     const std::vector<TimeSeriesVariableComparisonSpec>& specs,
     bool periodsMatch,
     std::ostream& detailReport,
-    std::vector<std::string>& failReasons)
+    std::vector<std::string>& failReasons,
+    const ToleranceSettings& toleranceSettings)
 {
     ComparisonStatus aggregateStatus = ComparisonStatus::Pass;
 
@@ -2059,7 +2272,8 @@ ComparisonStatus compareRecordCollections(
             specs,
             detailReport,
             failReasons,
-            elementTypeName));
+            elementTypeName,
+            toleranceSettings));
     }
 
     return aggregateStatus;
@@ -2072,7 +2286,9 @@ ComparisonStatus compareSubcatchmentsForModel(
     const fs::path& originalRoutingBinary,
     const fs::path& newRoutingBinary,
     const fs::path& detailReportPath,
-    std::vector<std::string>& failReasons)
+    std::vector<std::string>& failReasons,
+    const ToleranceSettings& toleranceSettings,
+    const std::vector<std::string>& toleranceOverrideMessages)
 {
     fs::create_directories(detailReportPath.parent_path());
     std::ofstream detailReport(detailReportPath);
@@ -2086,7 +2302,7 @@ ComparisonStatus compareSubcatchmentsForModel(
     detailReport << "New runoff binary: " << newRunoffBinary << "\n\n";
     detailReport << "Original routing binary: " << originalRoutingBinary << "\n";
     detailReport << "New routing binary: " << newRoutingBinary << "\n\n";
-    writeToleranceOverview(detailReport);
+    writeToleranceOverview(detailReport, toleranceSettings, toleranceOverrideMessages);
 
     if (!fs::exists(originalRunoffBinary))
     {
@@ -2212,7 +2428,12 @@ ComparisonStatus compareSubcatchmentsForModel(
 
             combineStatus(
                 modelStatus,
-                compareSubcatchmentTimeSeries(originalRecord, newRecord, detailReport, failReasons));
+                compareSubcatchmentTimeSeries(
+                    originalRecord,
+                    newRecord,
+                    detailReport,
+                    failReasons,
+                    toleranceSettings));
         }
 
         if (originalRecordIndex < originalResults.subcatchmentSummaries.size() &&
@@ -2225,7 +2446,8 @@ ComparisonStatus compareSubcatchmentsForModel(
                 originalResults.subcatchmentSummaries[originalRecordIndex],
                 newResults.subcatchmentSummaries[newRecordIndex->second],
                 detailReport,
-                failReasons));
+                failReasons,
+                toleranceSettings));
         }
         else
         {
@@ -2248,7 +2470,8 @@ ComparisonStatus compareSubcatchmentsForModel(
         hydrologyNodeSpecs,
         periodsMatch,
         detailReport,
-        failReasons));
+        failReasons,
+        toleranceSettings));
 
     const std::map<std::string, size_t> originalHydrologyNodeIndex =
         buildRecordIndex(originalResults.hydrologyNodeRecords);
@@ -2269,7 +2492,8 @@ ComparisonStatus compareSubcatchmentsForModel(
                 originalResults.hydrologyNodeSummaries[originalRecordIndex],
                 newResults.hydrologyNodeSummaries[newRecordIndex->second],
                 detailReport,
-                failReasons));
+                failReasons,
+                toleranceSettings));
         }
         else
         {
@@ -2293,7 +2517,8 @@ ComparisonStatus compareSubcatchmentsForModel(
         hydrologyLinkSpecs,
         periodsMatch,
         detailReport,
-        failReasons));
+        failReasons,
+        toleranceSettings));
 
     const std::map<std::string, size_t> originalHydrologyLinkIndex =
         buildRecordIndex(originalResults.hydrologyLinkRecords);
@@ -2314,7 +2539,8 @@ ComparisonStatus compareSubcatchmentsForModel(
                 originalResults.hydrologyLinkSummaries[originalRecordIndex],
                 newResults.hydrologyLinkSummaries[newRecordIndex->second],
                 detailReport,
-                failReasons));
+                failReasons,
+                toleranceSettings));
         }
         else
         {
@@ -2348,7 +2574,8 @@ ComparisonStatus compareSubcatchmentsForModel(
         hydrologyWSUDSpecs,
         periodsMatch,
         detailReport,
-        failReasons));
+        failReasons,
+        toleranceSettings));
 
     const std::map<std::string, size_t> originalHydrologyWSUDIndex =
         buildRecordIndex(originalResults.hydrologyWSUDRecords);
@@ -2369,7 +2596,8 @@ ComparisonStatus compareSubcatchmentsForModel(
                 originalResults.hydrologyWSUDSummaries[originalRecordIndex],
                 newResults.hydrologyWSUDSummaries[newRecordIndex->second],
                 detailReport,
-                failReasons));
+                failReasons,
+                toleranceSettings));
         }
         else
         {
@@ -2408,7 +2636,8 @@ ComparisonStatus compareSubcatchmentsForModel(
         hydraulicNodeSpecs,
         routingPeriodsMatch,
         detailReport,
-        failReasons));
+        failReasons,
+        toleranceSettings));
 
     const std::map<std::string, size_t> originalHydraulicNodeIndex =
         buildRecordIndex(originalRoutingResults.hydraulicNodeRecords);
@@ -2429,7 +2658,8 @@ ComparisonStatus compareSubcatchmentsForModel(
                 originalRoutingResults.hydraulicNodeSummaries[originalRecordIndex],
                 newRoutingResults.hydraulicNodeSummaries[newRecordIndex->second],
                 detailReport,
-                failReasons));
+                failReasons,
+                toleranceSettings));
         }
         else
         {
@@ -2455,7 +2685,8 @@ ComparisonStatus compareSubcatchmentsForModel(
         hydraulicLinkSpecs,
         routingPeriodsMatch,
         detailReport,
-        failReasons));
+        failReasons,
+        toleranceSettings));
 
     const std::map<std::string, size_t> originalHydraulicLinkIndex =
         buildRecordIndex(originalRoutingResults.hydraulicLinkRecords);
@@ -2476,7 +2707,8 @@ ComparisonStatus compareSubcatchmentsForModel(
                 originalRoutingResults.hydraulicLinkSummaries[originalRecordIndex],
                 newRoutingResults.hydraulicLinkSummaries[newRecordIndex->second],
                 detailReport,
-                failReasons));
+                failReasons,
+                toleranceSettings));
         }
         else
         {
@@ -2534,8 +2766,11 @@ int compareSubcatchmentsForAllModels(
 
         ComparisonStatus modelStatus = ComparisonStatus::Fail;
         std::vector<std::string> failReasons;
+        std::vector<std::string> toleranceOverrideMessages;
         try
         {
+            const ToleranceSettings toleranceSettings =
+                readToleranceSettingsForModel(originalModelFolder, toleranceOverrideMessages);
             modelStatus = compareSubcatchmentsForModel(
                 modelName,
                 originalRunoffBinary,
@@ -2543,7 +2778,9 @@ int compareSubcatchmentsForAllModels(
                 originalRoutingBinary,
                 newRoutingBinary,
                 detailReportPath,
-                failReasons);
+                failReasons,
+                toleranceSettings,
+                toleranceOverrideMessages);
         }
         catch (const std::exception& e)
         {
