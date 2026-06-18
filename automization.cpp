@@ -1679,6 +1679,7 @@ void writeTimeSeriesComparisonRow(
     int warnedValues,
     int failedValues,
     int missingValues,
+    int skippedValues,
     double maxCheckedDifference,
     double maxPercentDeviation,
     double maxAbsoluteDifference,
@@ -1693,6 +1694,7 @@ void writeTimeSeriesComparisonRow(
         << "warned_values=" << std::right << std::setw(8) << warnedValues << "  "
         << "failed_values=" << std::right << std::setw(8) << failedValues << "  "
         << "missing_values=" << std::right << std::setw(8) << missingValues << "  "
+        << "skipped_values=" << std::right << std::setw(8) << skippedValues << "  "
         << "max_checked_difference=" << std::right << std::setw(14) << formatDeviation(maxCheckedDifference) << "  "
         << "mode=" << std::left << std::setw(8) << maxDifferenceMode
         << "max_deviation_percent=" << std::right << std::setw(14) << formatDeviation(maxPercentDeviation) << "  "
@@ -1708,6 +1710,7 @@ struct TimeSeriesVariableComparisonSpec
     int index = 0;
     const char* name = "";
     ToleranceQuantity quantity = ToleranceQuantity::Flow;
+    int skipIfIndexBelowFlowNearZero = -1;
 };
 
 ComparisonStatus compareTimeSeriesVariables(
@@ -1730,6 +1733,7 @@ ComparisonStatus compareTimeSeriesVariables(
         int warnedValues = 0;
         int failedValues = 0;
         int missingValues = 0;
+        int skippedValues = 0;
         double maxCheckedDifference = 0.0;
         double maxPercentDeviation = 0.0;
         double maxAbsoluteDifference = 0.0;
@@ -1740,6 +1744,7 @@ ComparisonStatus compareTimeSeriesVariables(
         ComparisonStatus selectedDisplayStatus = ComparisonStatus::Pass;
         bool hasDisplayValue = false;
         const ToleranceRule rule = toleranceRule(toleranceSettings, spec.quantity);
+        const ToleranceRule flowRule = toleranceRule(toleranceSettings, ToleranceQuantity::Flow);
 
         for (size_t period = 0; period < originalRecord.values.size(); ++period)
         {
@@ -1753,6 +1758,25 @@ ComparisonStatus compareTimeSeriesVariables(
                 ++failedValues;
                 ++missingValues;
                 continue;
+            }
+
+            if (spec.skipIfIndexBelowFlowNearZero >= 0)
+            {
+                const size_t skipIndex = static_cast<size_t>(spec.skipIfIndexBelowFlowNearZero);
+                if (originalValues.size() <= skipIndex || newValues.size() <= skipIndex)
+                {
+                    variableStatus = ComparisonStatus::Fail;
+                    ++failedValues;
+                    ++missingValues;
+                    continue;
+                }
+
+                if (std::fabs(originalValues[skipIndex]) < flowRule.nearZeroThreshold ||
+                    std::fabs(newValues[skipIndex]) < flowRule.nearZeroThreshold)
+                {
+                    ++skippedValues;
+                    continue;
+                }
             }
 
             const double originalValue = originalValues[spec.index];
@@ -1810,6 +1834,7 @@ ComparisonStatus compareTimeSeriesVariables(
             warnedValues,
             failedValues,
             missingValues,
+            skippedValues,
             maxCheckedDifference,
             maxPercentDeviation,
             maxAbsoluteDifference,
@@ -1839,6 +1864,7 @@ ComparisonStatus compareSubcatchmentTimeSeries(
         int warnedValues = 0;
         int failedValues = 0;
         int missingValues = 0;
+        int skippedValues = 0;
         double maxCheckedDifference = 0.0;
         double maxPercentDeviation = 0.0;
         double maxAbsoluteDifference = 0.0;
@@ -1932,6 +1958,7 @@ ComparisonStatus compareSubcatchmentTimeSeries(
             warnedValues,
             failedValues,
             missingValues,
+            skippedValues,
             maxCheckedDifference,
             maxPercentDeviation,
             maxAbsoluteDifference,
@@ -2673,7 +2700,7 @@ ComparisonStatus compareSubcatchmentsForModel(
     {
         { 0, "FLOW", ToleranceQuantity::Flow },
         { 1, "DEPTH", ToleranceQuantity::Depth },
-        { 2, "VELOCITY", ToleranceQuantity::Velocity },
+        { 2, "VELOCITY", ToleranceQuantity::Velocity, 0 },
         { 3, "VOLUME", ToleranceQuantity::Volume }
     };
 
