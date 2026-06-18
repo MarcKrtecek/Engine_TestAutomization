@@ -29,6 +29,8 @@
 #include <windows.h>
 #include <stdexcept>
 
+#include "tolerances.h"
+
 namespace fs = std::filesystem;
 
 constexpr int32_t MAGICNUMBER = 516114522;
@@ -2557,6 +2559,7 @@ int runEngine_onAllInputFiles(char* argv[], bool useDll)
             std::cerr << "Could not create output folder: " << outputFolder << "\n";
             std::cerr << e.what() << "\n";
             ++failedRuns;
+            printf("");
             continue;
         }
 
