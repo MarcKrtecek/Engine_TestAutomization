@@ -1,0 +1,24 @@
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.VC.db
+*.VC.opendb
+
+# Build outputs
+Debug/
+Release/
+x64/
+x86/
+
+# Compiler artifacts
+*.obj
+*.pch
+*.pdb
+*.ilk
+*.idb
+*.ipch
+
+# Your local engine copy
+EngineSource/
