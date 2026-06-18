@@ -1336,6 +1336,21 @@ void combineStatus(ComparisonStatus& aggregateStatus, ComparisonStatus newStatus
         aggregateStatus = ComparisonStatus::Warn;
 }
 
+int comparisonStatusRank(ComparisonStatus status)
+{
+    switch (status)
+    {
+    case ComparisonStatus::Pass:
+        return 0;
+    case ComparisonStatus::Warn:
+        return 1;
+    case ComparisonStatus::Fail:
+        return 2;
+    default:
+        return 2;
+    }
+}
+
 double percentageDeviation(double originalValue, double newValue)
 {
     if (originalValue == 0.0)
@@ -1465,6 +1480,7 @@ void writeTimeSeriesComparisonRow(
     ComparisonStatus status,
     int warnedValues,
     int failedValues,
+    int missingValues,
     double maxCheckedDifference,
     double maxPercentDeviation,
     double maxAbsoluteDifference,
@@ -1478,6 +1494,7 @@ void writeTimeSeriesComparisonRow(
         << std::setw(8) << comparisonStatusText(status)
         << "warned_values=" << std::right << std::setw(8) << warnedValues << "  "
         << "failed_values=" << std::right << std::setw(8) << failedValues << "  "
+        << "missing_values=" << std::right << std::setw(8) << missingValues << "  "
         << "max_checked_difference=" << std::right << std::setw(14) << formatDeviation(maxCheckedDifference) << "  "
         << "mode=" << std::left << std::setw(8) << maxDifferenceMode
         << "max_deviation_percent=" << std::right << std::setw(14) << formatDeviation(maxPercentDeviation) << "  "
@@ -1513,6 +1530,7 @@ ComparisonStatus compareTimeSeriesVariables(
         ComparisonStatus variableStatus = ComparisonStatus::Pass;
         int warnedValues = 0;
         int failedValues = 0;
+        int missingValues = 0;
         double maxCheckedDifference = 0.0;
         double maxPercentDeviation = 0.0;
         double maxAbsoluteDifference = 0.0;
@@ -1520,6 +1538,8 @@ ComparisonStatus compareTimeSeriesVariables(
         double originalValueAtMaxDeviation = 0.0;
         double newValueAtMaxDeviation = 0.0;
         std::string maxDifferenceMode = "percent";
+        ComparisonStatus selectedDisplayStatus = ComparisonStatus::Pass;
+        bool hasDisplayValue = false;
         const ToleranceRule rule = defaultToleranceRule(spec.quantity);
 
         for (size_t period = 0; period < originalRecord.values.size(); ++period)
@@ -1532,6 +1552,7 @@ ComparisonStatus compareTimeSeriesVariables(
             {
                 variableStatus = ComparisonStatus::Fail;
                 ++failedValues;
+                ++missingValues;
                 continue;
             }
 
@@ -1540,8 +1561,16 @@ ComparisonStatus compareTimeSeriesVariables(
             const ValueComparisonResult valueResult =
                 compareValuesWithTolerance(originalValue, newValue, rule);
 
-            if (valueResult.checkedDifference > maxCheckedDifference)
+            const bool shouldUseAsDisplayValue =
+                !hasDisplayValue ||
+                comparisonStatusRank(valueResult.status) > comparisonStatusRank(selectedDisplayStatus) ||
+                (valueResult.status == selectedDisplayStatus &&
+                    valueResult.checkedDifference > maxCheckedDifference);
+
+            if (shouldUseAsDisplayValue)
             {
+                hasDisplayValue = true;
+                selectedDisplayStatus = valueResult.status;
                 maxCheckedDifference = valueResult.checkedDifference;
                 maxPercentDeviation = valueResult.percentDeviation;
                 maxAbsoluteDifference = valueResult.absoluteDifference;
@@ -1581,6 +1610,7 @@ ComparisonStatus compareTimeSeriesVariables(
             variableStatus,
             warnedValues,
             failedValues,
+            missingValues,
             maxCheckedDifference,
             maxPercentDeviation,
             maxAbsoluteDifference,
@@ -1608,6 +1638,7 @@ ComparisonStatus compareSubcatchmentTimeSeries(
         ComparisonStatus variableStatus = ComparisonStatus::Pass;
         int warnedValues = 0;
         int failedValues = 0;
+        int missingValues = 0;
         double maxCheckedDifference = 0.0;
         double maxPercentDeviation = 0.0;
         double maxAbsoluteDifference = 0.0;
@@ -1615,6 +1646,8 @@ ComparisonStatus compareSubcatchmentTimeSeries(
         double originalValueAtMaxDeviation = 0.0;
         double newValueAtMaxDeviation = 0.0;
         std::string maxDifferenceMode = spec.requireExactMatch ? "exact" : "percent";
+        ComparisonStatus selectedDisplayStatus = ComparisonStatus::Pass;
+        bool hasDisplayValue = false;
         const ToleranceRule rule = defaultToleranceRule(spec.quantity);
 
         for (size_t period = 0; period < originalRecord.values.size(); ++period)
@@ -1627,6 +1660,7 @@ ComparisonStatus compareSubcatchmentTimeSeries(
             {
                 variableStatus = ComparisonStatus::Fail;
                 ++failedValues;
+                ++missingValues;
                 continue;
             }
 
@@ -1648,8 +1682,16 @@ ComparisonStatus compareSubcatchmentTimeSeries(
                 valueResult = compareValuesWithTolerance(originalValue, newValue, rule);
             }
 
-            if (valueResult.checkedDifference > maxCheckedDifference)
+            const bool shouldUseAsDisplayValue =
+                !hasDisplayValue ||
+                comparisonStatusRank(valueResult.status) > comparisonStatusRank(selectedDisplayStatus) ||
+                (valueResult.status == selectedDisplayStatus &&
+                    valueResult.checkedDifference > maxCheckedDifference);
+
+            if (shouldUseAsDisplayValue)
             {
+                hasDisplayValue = true;
+                selectedDisplayStatus = valueResult.status;
                 maxCheckedDifference = valueResult.checkedDifference;
                 maxPercentDeviation = valueResult.percentDeviation;
                 maxAbsoluteDifference = valueResult.absoluteDifference;
@@ -1689,6 +1731,7 @@ ComparisonStatus compareSubcatchmentTimeSeries(
             variableStatus,
             warnedValues,
             failedValues,
+            missingValues,
             maxCheckedDifference,
             maxPercentDeviation,
             maxAbsoluteDifference,
