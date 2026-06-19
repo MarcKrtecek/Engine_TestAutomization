@@ -21,7 +21,8 @@ enum class ToleranceQuantity
     Time,
     Count,
     PercentPoint,
-    FlowRegime
+    FlowRegime,
+    PollutantLoad
 };
 
 struct ToleranceRule
@@ -50,6 +51,7 @@ struct ToleranceSettings
     ToleranceRule count;
     ToleranceRule percentPoint;
     ToleranceRule flowRegime;
+    ToleranceRule pollutantLoad;
 };
 
 namespace DefaultTolerances
@@ -176,6 +178,18 @@ namespace DefaultTolerances
         true,
         false
     };
+
+    // Annual pollutant loads use the WSUD specification's pollutant tolerance.
+    inline constexpr ToleranceRule PollutantLoad =
+    {
+        2.0,
+        5.0,
+        0.0,
+        0.0,
+        0.0,
+        false,
+        false
+    };
 }
 
 inline constexpr ToleranceSettings defaultToleranceSettings()
@@ -191,7 +205,8 @@ inline constexpr ToleranceSettings defaultToleranceSettings()
         DefaultTolerances::Time,
         DefaultTolerances::Count,
         DefaultTolerances::PercentPoint,
-        DefaultTolerances::FlowRegime
+        DefaultTolerances::FlowRegime,
+        DefaultTolerances::PollutantLoad
     };
 }
 
@@ -219,6 +234,8 @@ inline constexpr ToleranceRule defaultToleranceRule(ToleranceQuantity quantity)
         return DefaultTolerances::PercentPoint;
     case ToleranceQuantity::FlowRegime:
         return DefaultTolerances::FlowRegime;
+    case ToleranceQuantity::PollutantLoad:
+        return DefaultTolerances::PollutantLoad;
     default:
         return DefaultTolerances::Flow;
     }
@@ -250,6 +267,8 @@ inline constexpr ToleranceRule toleranceRule(
         return settings.percentPoint;
     case ToleranceQuantity::FlowRegime:
         return settings.flowRegime;
+    case ToleranceQuantity::PollutantLoad:
+        return settings.pollutantLoad;
     default:
         return settings.flow;
     }

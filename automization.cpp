@@ -29,6 +29,7 @@
 #include <windows.h>
 #include <stdexcept>
 #include <cctype>
+#include <array>
 
 #include "tolerances.h"
 
@@ -196,6 +197,7 @@ struct BufferedTimeSeriesResults
 
 struct SubcatchAnnualRunoffSummary
 {
+    double peakRunoff = 0.0;
     double imperviousRunoff = 0.0;
     double perviousRunoff = 0.0;
     double totalRunoff = 0.0;
@@ -210,6 +212,22 @@ struct HydrologyLinkSummary
 {
     double totalInflowVolume = 0.0;
     double totalOutflowVolume = 0.0;
+};
+
+struct HydrologyWSUDPollutantSummary
+{
+    double totalInflowLoad = 0.0;
+    double directOutflowLoad = 0.0;
+    double wsudEffectivenessPercent = 0.0;
+    double treatmentTrainSourceLoad = 0.0;
+    double treatmentTrainResidualLoad = 0.0;
+    double treatmentTrainResidualAnnualLoad = 0.0;
+    double pollutantLoadLostFromSystem = 0.0;
+    double initialLoad = 0.0;
+    double finalLoad = 0.0;
+    double lowBypassLoad = 0.0;
+    double highBypassLoad = 0.0;
+    double removedLoad = 0.0;
 };
 
 struct HydrologyWSUDSummary
@@ -227,25 +245,38 @@ struct HydrologyWSUDSummary
     double volumeOverflow = 0.0;
     double treatmentTrainSourceFlow = 0.0;
     double treatmentTrainResidualFlow = 0.0;
+    std::vector<HydrologyWSUDPollutantSummary> pollutantSummaries;
 };
 
 struct HydraulicNodeSummary
 {
     double avgDepth = 0.0;
     double maxDepth = 0.0;
+    double maxHead = 0.0;
+    double maxDepthTimeSeconds = 0.0;
     double maxLatFlow = 0.0;
     double maxInflow = 0.0;
     double totalLatFlow = 0.0;
     double totalInflow = 0.0;
     double continuityError = 0.0;
+    double timeSurchargedSeconds = 0.0;
+    double timeFloodedSeconds = 0.0;
     double volumeFlooded = 0.0;
 };
 
 struct HydraulicLinkSummary
 {
     double maxFlow = 0.0;
+    double maxFlowTimeSeconds = 0.0;
     double maxVelocity = 0.0;
     double maxFlowRatio = 0.0;
+    std::array<double, 10> flowClassification{};
+    double timeSurchargedSeconds = 0.0;
+    double timeFullUpstreamSeconds = 0.0;
+    double timeFullDownstreamSeconds = 0.0;
+    double timeFullFlowSeconds = 0.0;
+    double timeCapacityLimitedSeconds = 0.0;
+    double pumpStartUps = 0.0;
 };
 
 class BinaryReader
@@ -495,6 +526,7 @@ struct RunoffBinaryLayout
     std::vector<std::string> hydrologyLinkIDs;
     std::vector<std::string> hydrologyNodeIDs;
     std::vector<std::string> wsudIDs;
+    std::vector<std::string> pollutantIDs;
     std::vector<int32_t> subcatchVariableCodes;
     std::vector<int32_t> hydrologyLinkVariableCodes;
     std::vector<int32_t> hydrologyNodeVariableCodes;
@@ -522,6 +554,87 @@ struct RoutingBinaryResults
     std::vector<HydraulicNodeSummary> hydraulicNodeSummaries;
     std::vector<HydraulicLinkSummary> hydraulicLinkSummaries;
 };
+
+std::string toLower(std::string text);
+
+struct ModelRunJob
+{
+    fs::path inpFile;
+    fs::path inputFolder;
+    fs::path outputParentFolder;
+    fs::path regressionResultFolder;
+    fs::path outputFolder;
+    std::string modelName;
+    fs::path displayName;
+};
+
+bool isInpFile(const fs::path& path)
+{
+    return toLower(path.extension().string()) == ".inp";
+}
+
+void addModelRunJob(
+    std::vector<ModelRunJob>& jobs,
+    const fs::path& inpFile,
+    const fs::path& inputFolder,
+    const fs::path& outputParentFolder,
+    const fs::path& displayName)
+{
+    ModelRunJob job;
+    job.inpFile = inpFile;
+    job.inputFolder = inputFolder;
+    job.outputParentFolder = outputParentFolder;
+    job.modelName = inpFile.stem().string();
+    job.regressionResultFolder = inputFolder / job.modelName;
+    job.outputFolder = outputParentFolder / job.modelName;
+    job.displayName = displayName;
+    jobs.push_back(std::move(job));
+}
+
+std::vector<ModelRunJob> discoverModelRunJobs(
+    const fs::path& inpFolder,
+    const fs::path& baseOutputFolder)
+{
+    std::vector<ModelRunJob> jobs;
+
+    for (const fs::directory_entry& entry : fs::directory_iterator(inpFolder))
+    {
+        if (!entry.is_regular_file() || !isInpFile(entry.path()))
+            continue;
+
+        addModelRunJob(
+            jobs,
+            entry.path(),
+            inpFolder,
+            baseOutputFolder,
+            entry.path().filename());
+    }
+
+    const fs::path stormsFolder = inpFolder / "Storms";
+    if (!fs::exists(stormsFolder) || !fs::is_directory(stormsFolder))
+        return jobs;
+
+    for (const fs::directory_entry& entry : fs::recursive_directory_iterator(stormsFolder))
+    {
+        if (!entry.is_regular_file() || !isInpFile(entry.path()))
+            continue;
+
+        const fs::path inpFile = entry.path();
+        const fs::path inputParentFolder = inpFile.parent_path();
+        const fs::path relativeParentFolder = fs::relative(inputParentFolder, inpFolder);
+        const fs::path outputParentFolder = baseOutputFolder / relativeParentFolder;
+        const fs::path displayName = relativeParentFolder / inpFile.filename();
+
+        addModelRunJob(
+            jobs,
+            inpFile,
+            inputParentFolder,
+            outputParentFolder,
+            displayName);
+    }
+
+    return jobs;
+}
 
 RoutingBinaryLayout readRoutingBinaryLayout(BinaryReader& reader)
 {
@@ -610,7 +723,7 @@ RunoffBinaryLayout readRunoffBinaryLayout(BinaryReader& reader)
     for (int32_t i = 0; i < layout.wsudCount; ++i)
         layout.wsudIDs.push_back(reader.readID());
     for (int32_t i = 0; i < layout.pollutantCount; ++i)
-        reader.readID();
+        layout.pollutantIDs.push_back(reader.readID());
 
     const int64_t fileSize = reader.fileSize();
     const int64_t footerSize =
@@ -732,8 +845,9 @@ std::vector<HydraulicNodeSummary> readHydraulicNodeSummaries(
         HydraulicNodeSummary summary;
         summary.avgDepth = reader.read<double>();       // index 0
         summary.maxDepth = reader.read<double>();       // index 1
-        reader.read<double>();                          // max head
-        reader.read<double>();                          // time of max depth
+        summary.maxHead = reader.read<double>();        // index 2
+        summary.maxDepthTimeSeconds =
+            reader.read<double>() * static_cast<double>(SecsPerDay); // index 3
         reader.read<double>();                          // max reported depth
         summary.maxLatFlow = reader.read<double>();     // index 5
         summary.maxInflow = reader.read<double>();      // index 6
@@ -741,8 +855,12 @@ std::vector<HydraulicNodeSummary> readHydraulicNodeSummaries(
         summary.totalLatFlow = reader.read<double>();   // index 8
         summary.totalInflow = reader.read<double>();    // index 9
         summary.continuityError = reader.read<double>(); // index 10
-        for (int skip = 11; skip < 17; ++skip)
-            reader.read<double>();
+        summary.timeSurchargedSeconds = reader.read<double>() * 3600.0; // index 11
+        reader.read<double>();                          // max surcharge depth
+        reader.read<double>();                          // depth below rim
+        summary.timeFloodedSeconds = reader.read<double>() * 3600.0; // index 14
+        reader.read<double>();                          // max overflow
+        reader.read<double>();                          // max overflow time
         summary.volumeFlooded = reader.read<double>();  // index 17
 
         summaries.push_back(summary);
@@ -765,13 +883,11 @@ std::vector<HydraulicLinkSummary> readHydraulicLinkSummaries(
 
         HydraulicLinkSummary summary;
         summary.maxFlow = reader.read<double>();        // index 0
-        reader.read<double>();                          // max flow date
+        summary.maxFlowTimeSeconds =
+            reader.read<double>() * static_cast<double>(SecsPerDay); // index 1
         summary.maxVelocity = reader.read<double>();    // index 2
         summary.maxFlowRatio = reader.read<double>();   // index 3
-        summaries.push_back(summary);
 
-        // Only these first fixed values are needed for now. Advance to the
-        // next link by consuming the rest of the variable-size link block.
         reader.read<double>(); // max depth ratio
         for (int skip = 0; skip < 3; ++skip)
             reader.read<double>(); // first three street summary doubles
@@ -786,8 +902,22 @@ std::vector<HydraulicLinkSummary> readHydraulicLinkSummaries(
             throw std::runtime_error("Invalid inlet location length in routing summary.");
         reader.seek(reader.tell() + inletLocationLength);
 
-        for (int skip = 0; skip < 28; ++skip)
-            reader.read<double>();
+        for (int skip = 0; skip < 4; ++skip)
+            reader.read<double>(); // remaining street summary doubles
+
+        for (double& flowClassValue : summary.flowClassification)
+            flowClassValue = reader.read<double>();
+
+        summary.timeSurchargedSeconds = reader.read<double>() * 3600.0;
+        summary.timeFullUpstreamSeconds = reader.read<double>() * 3600.0;
+        summary.timeFullDownstreamSeconds = reader.read<double>() * 3600.0;
+        summary.timeFullFlowSeconds = reader.read<double>() * 3600.0;
+        summary.timeCapacityLimitedSeconds = reader.read<double>() * 3600.0;
+
+        reader.read<double>(); // pump percent utilized
+        summary.pumpStartUps = reader.read<double>();
+        for (int skip = 0; skip < 7; ++skip)
+            reader.read<double>(); // remaining pump summary doubles
 
         if (layout.pollutantCount > 0)
         {
@@ -795,6 +925,7 @@ std::vector<HydraulicLinkSummary> readHydraulicLinkSummaries(
                 reader.read<double>();
         }
 
+        summaries.push_back(summary);
         position = reader.tell();
     }
 
@@ -877,6 +1008,7 @@ std::vector<SubcatchAnnualRunoffSummary> readSubcatchAnnualRunoffSummaries(
     BinaryReader& reader,
     const RunoffBinaryLayout& layout)
 {
+    constexpr int catchmentSummaryPeakRunoffIndex = 9;
     constexpr int catchmentSummaryAnnualImperviousIndex = 26;
     const int valuesPerCatchmentSummary = 64 + 6 * layout.pollutantCount;
 
@@ -893,6 +1025,13 @@ std::vector<SubcatchAnnualRunoffSummary> readSubcatchAnnualRunoffSummaries(
         reader.seek(position);
 
         SubcatchAnnualRunoffSummary summary;
+        reader.seek(
+            layout.catchmentSummaryStartPos +
+            static_cast<int64_t>(i) * valuesPerCatchmentSummary * static_cast<int64_t>(sizeof(double)) +
+            catchmentSummaryPeakRunoffIndex * static_cast<int64_t>(sizeof(double)));
+        summary.peakRunoff = reader.read<double>();
+
+        reader.seek(position);
         summary.imperviousRunoff = reader.read<double>();
         summary.perviousRunoff = reader.read<double>();
         summary.totalRunoff = reader.read<double>();
@@ -957,7 +1096,7 @@ std::vector<HydrologyWSUDSummary> readHydrologyWSUDSummaries(
     BinaryReader& reader,
     const RunoffBinaryLayout& layout)
 {
-    const int valuesPerHydrologyWSUDSummary = 13 + 11 * layout.pollutantCount;
+    const int valuesPerHydrologyWSUDSummary = 13 + 12 * layout.pollutantCount;
 
     std::vector<HydrologyWSUDSummary> summaries;
     summaries.reserve(static_cast<size_t>(layout.wsudCount));
@@ -986,6 +1125,24 @@ std::vector<HydrologyWSUDSummary> readHydrologyWSUDSummaries(
         summary.volumeOverflow = reader.read<double>();
         summary.treatmentTrainSourceFlow = reader.read<double>();
         summary.treatmentTrainResidualFlow = reader.read<double>();
+        summary.pollutantSummaries.reserve(static_cast<size_t>(layout.pollutantCount));
+        for (int32_t pollutantIndex = 0; pollutantIndex < layout.pollutantCount; ++pollutantIndex)
+        {
+            HydrologyWSUDPollutantSummary pollutantSummary;
+            pollutantSummary.totalInflowLoad = reader.read<double>();
+            pollutantSummary.directOutflowLoad = reader.read<double>();
+            pollutantSummary.wsudEffectivenessPercent = reader.read<double>();
+            pollutantSummary.treatmentTrainSourceLoad = reader.read<double>();
+            pollutantSummary.treatmentTrainResidualLoad = reader.read<double>();
+            pollutantSummary.treatmentTrainResidualAnnualLoad = reader.read<double>();
+            pollutantSummary.pollutantLoadLostFromSystem = reader.read<double>();
+            pollutantSummary.initialLoad = reader.read<double>();
+            pollutantSummary.finalLoad = reader.read<double>();
+            pollutantSummary.lowBypassLoad = reader.read<double>();
+            pollutantSummary.highBypassLoad = reader.read<double>();
+            pollutantSummary.removedLoad = reader.read<double>();
+            summary.pollutantSummaries.push_back(pollutantSummary);
+        }
         summaries.push_back(summary);
     }
 
@@ -1201,8 +1358,11 @@ void writeSelectedTimeSeriesResults(
     output << "\n";
 }
 
-int exportTemporaryBinaryTimeSeriesResults(const fs::path& baseOutputFolder)
+int exportTemporaryBinaryTimeSeriesResults(
+    const fs::path& inpFolder,
+    const fs::path& baseOutputFolder)
 {
+    const std::vector<ModelRunJob> jobs = discoverModelRunJobs(inpFolder, baseOutputFolder);
     const fs::path outputFile = baseOutputFolder / "temporary_binary_timeseries_results.txt";
     std::ofstream output(outputFile);
     if (!output)
@@ -1214,13 +1374,10 @@ int exportTemporaryBinaryTimeSeriesResults(const fs::path& baseOutputFolder)
 
     int errors = 0;
 
-    for (const auto& entry : fs::directory_iterator(baseOutputFolder))
+    for (const ModelRunJob& job : jobs)
     {
-        if (!entry.is_directory())
-            continue;
-
-        const fs::path modelFolder = entry.path();
-        const std::string modelName = modelFolder.filename().string();
+        const fs::path modelFolder = job.outputFolder;
+        const std::string modelName = job.modelName;
         const fs::path runoffBinary =
             findBinaryFile(baseOutputFolder, modelFolder, modelName + "_runoff.bin");
         const fs::path routingBinary =
@@ -1246,7 +1403,7 @@ int exportTemporaryBinaryTimeSeriesResults(const fs::path& baseOutputFolder)
         {
             const BufferedTimeSeriesResults results =
                 populateTimeSeriesResults(runoffBinary, routingBinary);
-            writeSelectedTimeSeriesResults(output, modelName, results);
+            writeSelectedTimeSeriesResults(output, job.displayName.string(), results);
         }
         catch (const std::exception& e)
         {
@@ -1456,6 +1613,7 @@ ToleranceRule* toleranceRuleForSection(ToleranceSettings& settings, const std::s
     if (lowerSection == "count") return &settings.count;
     if (lowerSection == "percent_point") return &settings.percentPoint;
     if (lowerSection == "flow_regime") return &settings.flowRegime;
+    if (lowerSection == "pollutant_load") return &settings.pollutantLoad;
     return nullptr;
 }
 
@@ -1474,6 +1632,7 @@ const ToleranceRule* toleranceRuleForSection(
     if (lowerSection == "count") return &settings.count;
     if (lowerSection == "percent_point") return &settings.percentPoint;
     if (lowerSection == "flow_regime") return &settings.flowRegime;
+    if (lowerSection == "pollutant_load") return &settings.pollutantLoad;
     return nullptr;
 }
 
@@ -1622,6 +1781,8 @@ const char* toleranceQuantityName(ToleranceQuantity quantity)
         return "percent_point";
     case ToleranceQuantity::FlowRegime:
         return "flow_regime";
+    case ToleranceQuantity::PollutantLoad:
+        return "pollutant_load";
     default:
         return "unknown";
     }
@@ -1662,6 +1823,7 @@ void writeToleranceOverview(
     writeToleranceRule(output, settings, ToleranceQuantity::Count);
     writeToleranceRule(output, settings, ToleranceQuantity::PercentPoint);
     writeToleranceRule(output, settings, ToleranceQuantity::FlowRegime);
+    writeToleranceRule(output, settings, ToleranceQuantity::PollutantLoad);
     if (!overrideMessages.empty())
     {
         output << "\nTolerance overrides\n";
@@ -1973,7 +2135,7 @@ ComparisonStatus compareSubcatchmentTimeSeries(
 
 struct SummaryComparisonSpec
 {
-    const char* name;
+    std::string name;
     double originalValue;
     double newValue;
     ToleranceQuantity quantity;
@@ -1989,6 +2151,7 @@ ComparisonStatus compareSubcatchmentSummaries(
 {
     const SummaryComparisonSpec specs[] =
     {
+        { "peak_runoff", originalSummary.peakRunoff, newSummary.peakRunoff, ToleranceQuantity::Flow },
         { "annual_impervious_runoff", originalSummary.imperviousRunoff, newSummary.imperviousRunoff, ToleranceQuantity::Volume },
         { "annual_pervious_runoff", originalSummary.perviousRunoff, newSummary.perviousRunoff, ToleranceQuantity::Volume },
         { "annual_total_runoff", originalSummary.totalRunoff, newSummary.totalRunoff, ToleranceQuantity::Volume }
@@ -2119,34 +2282,74 @@ ComparisonStatus compareHydrologyWSUDSummary(
     const std::string& id,
     const HydrologyWSUDSummary& originalSummary,
     const HydrologyWSUDSummary& newSummary,
+    const std::vector<std::string>& pollutantIDs,
     std::ostream& detailReport,
     std::vector<std::string>& failReasons,
     const ToleranceSettings& toleranceSettings)
 {
-    return compareSummaryValues(
+    std::vector<SummaryComparisonSpec> specs =
+    {
+        { "volume_inflow", originalSummary.volumeInflow, newSummary.volumeInflow, ToleranceQuantity::Volume },
+        { "volume_lost_from_system", originalSummary.volumeLostFromSystem, newSummary.volumeLostFromSystem, ToleranceQuantity::Volume },
+        { "volume_network_outflow", originalSummary.volumeNetworkOutflow, newSummary.volumeNetworkOutflow, ToleranceQuantity::Volume },
+        { "volume_withdrawn", originalSummary.volumeWithdrawn, newSummary.volumeWithdrawn, ToleranceQuantity::Volume },
+        { "volume_requested", originalSummary.volumeRequested, newSummary.volumeRequested, ToleranceQuantity::Volume },
+        { "volume_low_flow_bypass", originalSummary.volumeLowFlowBypass, newSummary.volumeLowFlowBypass, ToleranceQuantity::Volume },
+        { "volume_high_flow_bypass", originalSummary.volumeHighFlowBypass, newSummary.volumeHighFlowBypass, ToleranceQuantity::Volume },
+        { "volume_evaporation", originalSummary.volumeEvaporation, newSummary.volumeEvaporation, ToleranceQuantity::Volume },
+        { "volume_exfiltration", originalSummary.volumeExfiltration, newSummary.volumeExfiltration, ToleranceQuantity::Volume },
+        { "volume_treated_flow", originalSummary.volumeTreatedFlow, newSummary.volumeTreatedFlow, ToleranceQuantity::Volume },
+        { "volume_overflow", originalSummary.volumeOverflow, newSummary.volumeOverflow, ToleranceQuantity::Volume },
+        { "treatment_train_source_flow", originalSummary.treatmentTrainSourceFlow, newSummary.treatmentTrainSourceFlow, ToleranceQuantity::Volume },
+        { "treatment_train_residual_flow", originalSummary.treatmentTrainResidualFlow, newSummary.treatmentTrainResidualFlow, ToleranceQuantity::Volume }
+    };
+
+    const size_t comparedPollutantCount =
+        (std::min)(originalSummary.pollutantSummaries.size(), newSummary.pollutantSummaries.size());
+    for (size_t i = 0; i < comparedPollutantCount; ++i)
+    {
+        const std::string pollutantName =
+            i < pollutantIDs.size() ? pollutantIDs[i] : "pollutant_" + std::to_string(i);
+        const std::string prefix = "pollutant_" + pollutantName + "_";
+        const HydrologyWSUDPollutantSummary& originalPollutant = originalSummary.pollutantSummaries[i];
+        const HydrologyWSUDPollutantSummary& newPollutant = newSummary.pollutantSummaries[i];
+
+        specs.push_back({ prefix + "total_inflow_load", originalPollutant.totalInflowLoad, newPollutant.totalInflowLoad, ToleranceQuantity::PollutantLoad });
+        specs.push_back({ prefix + "direct_outflow_load", originalPollutant.directOutflowLoad, newPollutant.directOutflowLoad, ToleranceQuantity::PollutantLoad });
+        specs.push_back({ prefix + "wsud_effectiveness_percent", originalPollutant.wsudEffectivenessPercent, newPollutant.wsudEffectivenessPercent, ToleranceQuantity::PercentPoint });
+        specs.push_back({ prefix + "treatment_train_source_load", originalPollutant.treatmentTrainSourceLoad, newPollutant.treatmentTrainSourceLoad, ToleranceQuantity::PollutantLoad });
+        specs.push_back({ prefix + "treatment_train_residual_load", originalPollutant.treatmentTrainResidualLoad, newPollutant.treatmentTrainResidualLoad, ToleranceQuantity::PollutantLoad });
+        specs.push_back({ prefix + "treatment_train_residual_annual_load", originalPollutant.treatmentTrainResidualAnnualLoad, newPollutant.treatmentTrainResidualAnnualLoad, ToleranceQuantity::PollutantLoad });
+        specs.push_back({ prefix + "load_lost_from_system", originalPollutant.pollutantLoadLostFromSystem, newPollutant.pollutantLoadLostFromSystem, ToleranceQuantity::PollutantLoad });
+        specs.push_back({ prefix + "initial_load", originalPollutant.initialLoad, newPollutant.initialLoad, ToleranceQuantity::PollutantLoad });
+        specs.push_back({ prefix + "final_load", originalPollutant.finalLoad, newPollutant.finalLoad, ToleranceQuantity::PollutantLoad });
+        specs.push_back({ prefix + "low_bypass_load", originalPollutant.lowBypassLoad, newPollutant.lowBypassLoad, ToleranceQuantity::PollutantLoad });
+        specs.push_back({ prefix + "high_bypass_load", originalPollutant.highBypassLoad, newPollutant.highBypassLoad, ToleranceQuantity::PollutantLoad });
+        specs.push_back({ prefix + "removed_load", originalPollutant.removedLoad, newPollutant.removedLoad, ToleranceQuantity::PollutantLoad });
+    }
+
+    ComparisonStatus status = compareSummaryValues(
         "Hydrology WSUD summary",
         id,
         originalSummary,
         newSummary,
-        {
-            { "volume_inflow", originalSummary.volumeInflow, newSummary.volumeInflow, ToleranceQuantity::Volume },
-            { "volume_lost_from_system", originalSummary.volumeLostFromSystem, newSummary.volumeLostFromSystem, ToleranceQuantity::Volume },
-            { "volume_network_outflow", originalSummary.volumeNetworkOutflow, newSummary.volumeNetworkOutflow, ToleranceQuantity::Volume },
-            { "volume_withdrawn", originalSummary.volumeWithdrawn, newSummary.volumeWithdrawn, ToleranceQuantity::Volume },
-            { "volume_requested", originalSummary.volumeRequested, newSummary.volumeRequested, ToleranceQuantity::Volume },
-            { "volume_low_flow_bypass", originalSummary.volumeLowFlowBypass, newSummary.volumeLowFlowBypass, ToleranceQuantity::Volume },
-            { "volume_high_flow_bypass", originalSummary.volumeHighFlowBypass, newSummary.volumeHighFlowBypass, ToleranceQuantity::Volume },
-            { "volume_evaporation", originalSummary.volumeEvaporation, newSummary.volumeEvaporation, ToleranceQuantity::Volume },
-            { "volume_exfiltration", originalSummary.volumeExfiltration, newSummary.volumeExfiltration, ToleranceQuantity::Volume },
-            { "volume_treated_flow", originalSummary.volumeTreatedFlow, newSummary.volumeTreatedFlow, ToleranceQuantity::Volume },
-            { "volume_overflow", originalSummary.volumeOverflow, newSummary.volumeOverflow, ToleranceQuantity::Volume },
-            { "treatment_train_source_flow", originalSummary.treatmentTrainSourceFlow, newSummary.treatmentTrainSourceFlow, ToleranceQuantity::Volume },
-            { "treatment_train_residual_flow", originalSummary.treatmentTrainResidualFlow, newSummary.treatmentTrainResidualFlow, ToleranceQuantity::Volume }
-        },
+        specs,
         detailReport,
         failReasons,
         "hydrology WSUD",
         toleranceSettings);
+
+    if (originalSummary.pollutantSummaries.size() != newSummary.pollutantSummaries.size())
+    {
+        detailReport << "  pollutant_summary_count_mismatch"
+            << " original=" << originalSummary.pollutantSummaries.size()
+            << " new=" << newSummary.pollutantSummaries.size()
+            << "\n";
+        addFailReason(failReasons, "FAIL summary hydrology WSUD pollutant summary count mismatch");
+        status = ComparisonStatus::Fail;
+    }
+
+    return status;
 }
 
 ComparisonStatus compareHydraulicNodeSummary(
@@ -2165,11 +2368,15 @@ ComparisonStatus compareHydraulicNodeSummary(
         {
             { "avg_depth", originalSummary.avgDepth, newSummary.avgDepth, ToleranceQuantity::Depth },
             { "max_depth", originalSummary.maxDepth, newSummary.maxDepth, ToleranceQuantity::Depth },
+            { "max_hydraulic_grade", originalSummary.maxHead, newSummary.maxHead, ToleranceQuantity::Depth },
+            { "time_of_max_depth_seconds", originalSummary.maxDepthTimeSeconds, newSummary.maxDepthTimeSeconds, ToleranceQuantity::Time },
             { "max_lateral_flow", originalSummary.maxLatFlow, newSummary.maxLatFlow, ToleranceQuantity::Flow },
             { "max_inflow", originalSummary.maxInflow, newSummary.maxInflow, ToleranceQuantity::Flow },
             { "total_lateral_flow", originalSummary.totalLatFlow, newSummary.totalLatFlow, ToleranceQuantity::Volume },
             { "total_inflow", originalSummary.totalInflow, newSummary.totalInflow, ToleranceQuantity::Volume },
             { "continuity_error", originalSummary.continuityError, newSummary.continuityError, ToleranceQuantity::ContinuityError },
+            { "time_surcharged_seconds", originalSummary.timeSurchargedSeconds, newSummary.timeSurchargedSeconds, ToleranceQuantity::Time },
+            { "time_flooded_seconds", originalSummary.timeFloodedSeconds, newSummary.timeFloodedSeconds, ToleranceQuantity::Time },
             { "volume_flooded", originalSummary.volumeFlooded, newSummary.volumeFlooded, ToleranceQuantity::Volume }
         },
         detailReport,
@@ -2186,16 +2393,51 @@ ComparisonStatus compareHydraulicLinkSummary(
     std::vector<std::string>& failReasons,
     const ToleranceSettings& toleranceSettings)
 {
+    std::vector<SummaryComparisonSpec> specs =
+    {
+        { "max_flow", originalSummary.maxFlow, newSummary.maxFlow, ToleranceQuantity::Flow },
+        { "max_flow_time_seconds", originalSummary.maxFlowTimeSeconds, newSummary.maxFlowTimeSeconds, ToleranceQuantity::Time },
+        { "max_velocity", originalSummary.maxVelocity, newSummary.maxVelocity, ToleranceQuantity::Velocity },
+        { "max_flow_ratio", originalSummary.maxFlowRatio, newSummary.maxFlowRatio, ToleranceQuantity::PercentPoint },
+        { "time_surcharged_seconds", originalSummary.timeSurchargedSeconds, newSummary.timeSurchargedSeconds, ToleranceQuantity::Time },
+        { "time_full_upstream_seconds", originalSummary.timeFullUpstreamSeconds, newSummary.timeFullUpstreamSeconds, ToleranceQuantity::Time },
+        { "time_full_downstream_seconds", originalSummary.timeFullDownstreamSeconds, newSummary.timeFullDownstreamSeconds, ToleranceQuantity::Time },
+        { "time_full_flow_seconds", originalSummary.timeFullFlowSeconds, newSummary.timeFullFlowSeconds, ToleranceQuantity::Time },
+        { "time_capacity_limited_seconds", originalSummary.timeCapacityLimitedSeconds, newSummary.timeCapacityLimitedSeconds, ToleranceQuantity::Time },
+        { "pump_startups", originalSummary.pumpStartUps, newSummary.pumpStartUps, ToleranceQuantity::Count }
+    };
+
+    static const std::array<std::string, 10> flowClassificationNames =
+    {
+        "flow_modified_length_ratio",
+        "flow_class_0_fraction",
+        "flow_class_1_fraction",
+        "flow_class_2_fraction",
+        "flow_class_3_fraction",
+        "flow_class_4_fraction",
+        "flow_class_5_fraction",
+        "flow_class_6_fraction",
+        "time_normal_flow_fraction",
+        "time_inlet_control_fraction"
+    };
+
+    for (size_t i = 0; i < originalSummary.flowClassification.size(); ++i)
+    {
+        specs.push_back(
+            {
+                flowClassificationNames[i],
+                originalSummary.flowClassification[i],
+                newSummary.flowClassification[i],
+                ToleranceQuantity::FlowRegime
+            });
+    }
+
     return compareSummaryValues(
         "Hydraulic link summary",
         id,
         originalSummary,
         newSummary,
-        {
-            { "max_flow", originalSummary.maxFlow, newSummary.maxFlow, ToleranceQuantity::Flow },
-            { "max_velocity", originalSummary.maxVelocity, newSummary.maxVelocity, ToleranceQuantity::Velocity },
-            { "max_flow_ratio", originalSummary.maxFlowRatio, newSummary.maxFlowRatio, ToleranceQuantity::PercentPoint }
-        },
+        specs,
         detailReport,
         failReasons,
         "hydraulic link",
@@ -2622,6 +2864,7 @@ ComparisonStatus compareSubcatchmentsForModel(
                 id,
                 originalResults.hydrologyWSUDSummaries[originalRecordIndex],
                 newResults.hydrologyWSUDSummaries[newRecordIndex->second],
+                originalResults.layout.pollutantIDs,
                 detailReport,
                 failReasons,
                 toleranceSettings));
@@ -2753,6 +2996,7 @@ int compareSubcatchmentsForAllModels(
     const fs::path& inpFolder,
     const fs::path& baseOutputFolder)
 {
+    const std::vector<ModelRunJob> jobs = discoverModelRunJobs(inpFolder, baseOutputFolder);
     const fs::path mainReportPath = baseOutputFolder / "comparison_summary.txt";
     std::ofstream mainReport(mainReportPath);
     if (!mainReport)
@@ -2765,21 +3009,29 @@ int compareSubcatchmentsForAllModels(
     int failedModels = 0;
     int warnedModels = 0;
     int passedModels = 0;
-    constexpr int mainReportModelWidth = 32;
+    size_t longestModelNameLength = std::string("Model").size();
+    for (const ModelRunJob& job : jobs)
+    {
+        longestModelNameLength =
+            (std::max)(longestModelNameLength, job.displayName.string().size());
+    }
+
+    const int mainReportModelWidth =
+        static_cast<int>(longestModelNameLength) + 2;
     constexpr int mainReportResultWidth = 8;
     mainReport << std::left << std::setw(mainReportModelWidth) << "Model"
         << std::setw(mainReportResultWidth) << "Result"
         << "Fail reason\n";
-    mainReport << "=================\n";
+    mainReport << std::string(
+        static_cast<size_t>(mainReportModelWidth + mainReportResultWidth) +
+            std::string("Fail reason").size(),
+        '=') << "\n";
 
-    for (const auto& entry : fs::directory_iterator(inpFolder))
+    for (const ModelRunJob& job : jobs)
     {
-        if (!entry.is_directory())
-            continue;
-
-        const fs::path originalModelFolder = entry.path();
-        const std::string modelName = originalModelFolder.filename().string();
-        const fs::path newModelFolder = baseOutputFolder / modelName;
+        const fs::path originalModelFolder = job.regressionResultFolder;
+        const std::string modelName = job.modelName;
+        const fs::path newModelFolder = job.outputFolder;
         const fs::path originalRunoffBinary =
             originalModelFolder / (modelName + "_runoff.bin");
         const fs::path newRunoffBinary =
@@ -2797,7 +3049,7 @@ int compareSubcatchmentsForAllModels(
         try
         {
             const ToleranceSettings toleranceSettings =
-                readToleranceSettingsForModel(originalModelFolder, toleranceOverrideMessages);
+                readToleranceSettingsForModel(job.regressionResultFolder, toleranceOverrideMessages);
             modelStatus = compareSubcatchmentsForModel(
                 modelName,
                 originalRunoffBinary,
@@ -2817,10 +3069,11 @@ int compareSubcatchmentsForAllModels(
             if (detailReport)
             {
                 detailReport << "Model: " << modelName << "\n";
+                detailReport << "Input file: " << job.inpFile << "\n";
                 detailReport << "FAIL: " << e.what() << "\n";
             }
             std::cerr << "WARNING: Subcatchment comparison failed for model '"
-                << modelName << "': " << e.what() << "\n";
+                << job.displayName << "': " << e.what() << "\n";
             modelStatus = ComparisonStatus::Fail;
         }
 
@@ -2831,7 +3084,7 @@ int compareSubcatchmentsForAllModels(
         else
             ++passedModels;
 
-        mainReport << std::left << std::setw(mainReportModelWidth) << modelName
+        mainReport << std::left << std::setw(mainReportModelWidth) << job.displayName.string()
             << std::setw(mainReportResultWidth) << comparisonStatusText(modelStatus);
 
         if (modelStatus != ComparisonStatus::Fail || failReasons.empty())
@@ -2902,6 +3155,141 @@ int runProcess(const std::wstring& commandLine)
     CloseHandle(pi.hProcess);
 
     return static_cast<int>(exitCode);
+}
+
+std::string trimCarriageReturn(std::string line)
+{
+    if (!line.empty() && line.back() == '\r')
+        line.pop_back();
+    return line;
+}
+
+bool sectionNameEquals(const std::string& line, const std::string& sectionName)
+{
+    return toLower(trim(trimCarriageReturn(line))) == toLower(sectionName);
+}
+
+bool isSectionHeaderLine(const std::string& line)
+{
+    const std::string trimmedLine = trim(trimCarriageReturn(line));
+    return !trimmedLine.empty() && trimmedLine.front() == '[';
+}
+
+bool alterSingleInpFile(const fs::path& inpFile)
+{
+    std::ifstream input(inpFile, std::ios::binary);
+    if (!input)
+        throw std::runtime_error("Could not open INP file for reading: " + inpFile.string());
+
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    const std::string content = buffer.str();
+    const std::string newline = content.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+
+    std::vector<std::string> lines;
+    std::istringstream reader(content);
+    std::string line;
+    while (std::getline(reader, line))
+        lines.push_back(trimCarriageReturn(line));
+
+    if (!content.empty() && (content.back() == '\n' || content.back() == '\r'))
+        lines.push_back("");
+
+    for (const std::string& existingLine : lines)
+    {
+        if (sectionNameEquals(existingLine, "[REPORT_TIMESERIES]"))
+            return false;
+    }
+
+    size_t reportSectionIndex = lines.size();
+    for (size_t i = 0; i < lines.size(); ++i)
+    {
+        if (sectionNameEquals(lines[i], "[REPORT]"))
+        {
+            reportSectionIndex = i;
+            break;
+        }
+    }
+
+    if (reportSectionIndex == lines.size())
+    {
+        std::cerr << "WARNING: [REPORT] section not found in " << inpFile << "\n";
+        return false;
+    }
+
+    size_t insertIndex = lines.size();
+    for (size_t i = reportSectionIndex + 1; i < lines.size(); ++i)
+    {
+        if (isSectionHeaderLine(lines[i]))
+        {
+            insertIndex = i;
+            break;
+        }
+    }
+
+    lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(insertIndex), "[REPORT_TIMESERIES]");
+    lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(insertIndex + 1), "ALL");
+
+    std::ofstream output(inpFile, std::ios::binary | std::ios::trunc);
+    if (!output)
+        throw std::runtime_error("Could not open INP file for writing: " + inpFile.string());
+
+    for (size_t i = 0; i < lines.size(); ++i)
+    {
+        if (i > 0)
+            output << newline;
+        output << lines[i];
+    }
+
+    return true;
+}
+
+int AlterInpFiles(const fs::path& folder)
+{
+    const fs::path rootFolder = fs::absolute(folder);
+    if (!fs::exists(rootFolder) || !fs::is_directory(rootFolder))
+    {
+        std::cerr << "Input folder not found or not a directory: " << rootFolder << "\n";
+        return 1;
+    }
+
+    int inspectedFiles = 0;
+    int alteredFiles = 0;
+    int failedFiles = 0;
+
+    for (const fs::directory_entry& entry : fs::recursive_directory_iterator(rootFolder))
+    {
+        if (!entry.is_regular_file())
+            continue;
+
+        const fs::path inpFile = entry.path();
+        const std::string extension = toLower(inpFile.extension().string());
+        if (extension != ".inp")
+            continue;
+
+        ++inspectedFiles;
+        try
+        {
+            if (alterSingleInpFile(inpFile))
+            {
+                ++alteredFiles;
+                std::cout << "Altered: " << inpFile << "\n";
+            }
+        }
+        catch (const std::exception& e)
+        {
+            ++failedFiles;
+            std::cerr << "WARNING: Could not alter " << inpFile << ": " << e.what() << "\n";
+        }
+    }
+
+    std::cout << "\nAlterInpFiles summary\n";
+    std::cout << "---------------------\n";
+    std::cout << "Inspected: " << inspectedFiles << "\n";
+    std::cout << "Altered  : " << alteredFiles << "\n";
+    std::cout << "Failed   : " << failedFiles << "\n";
+
+    return failedFiles;
 }
 
 using SwmmRunFunction = int(__stdcall*)(const char*, const char*, const char*);
@@ -2986,21 +3374,12 @@ int runEngine_onAllInputFiles(char* argv[], bool useDll)
 
     int failedRuns = 0;
     int passedRuns = 0;
+    const std::vector<ModelRunJob> jobs = discoverModelRunJobs(inpFolder, baseOutputFolder);
 
-    for (const auto& entry : fs::directory_iterator(inpFolder))
+    for (const ModelRunJob& job : jobs)
     {
-        if (!entry.is_regular_file())
-            continue;
-
-        fs::path inpFile = entry.path();
-
-        if (inpFile.extension() != ".inp" &&
-            inpFile.extension() != ".INP")
-            continue;
-
-        fs::path outputFolder =
-            baseOutputFolder /
-            inpFile.stem();
+        fs::path inpFile = job.inpFile;
+        fs::path outputFolder = job.outputFolder;
 
         try
         {
@@ -3054,9 +3433,14 @@ int runEngine_onAllInputFiles(char* argv[], bool useDll)
 
 int main(int argc, char* argv[])
 {
+    if (argc == 2)
+        return AlterInpFiles(fs::path(argv[1]));
+
     if (argc < 4)
     {
-        std::cerr << "Usage: (exe) TestAutomation.exe <Engine.exe> <InpFolder> <OutputFolder>\n         (dll) TestAutomation.exe <Engine.exe> <InpFolder> <OutputFolder> DLL";
+        std::cerr << "Usage: (alter inp files) TestAutomation.exe <InpRootFolder>\n"
+            << "       (exe) TestAutomation.exe <Engine.exe> <InpFolder> <OutputFolder>\n"
+            << "       (dll) TestAutomation.exe <Engine.exe> <InpFolder> <OutputFolder> DLL";
         return 1;
     }
 
@@ -3069,7 +3453,7 @@ int main(int argc, char* argv[])
 
     int engineFails = runEngine_onAllInputFiles(argv, useDll);
     int comparisonFails = compareSubcatchmentsForAllModels(inpFolder, baseOutputFolder);
-    int binaryReadFails = exportTemporaryBinaryTimeSeriesResults(baseOutputFolder);
+    int binaryReadFails = exportTemporaryBinaryTimeSeriesResults(inpFolder, baseOutputFolder);
 
     return (std::max)((std::max)(engineFails, comparisonFails), binaryReadFails);
 }
