@@ -1566,6 +1566,69 @@ void addFailReason(std::vector<std::string>& failReasons, const std::string& rea
         failReasons.push_back(reason);
 }
 
+std::vector<std::string> summarizeMainReportFailReasons(
+    const std::vector<std::string>& failReasons)
+{
+    static const std::array<std::string, 6> elementTypes =
+    {
+        "subcatchment",
+        "hydrology node",
+        "hydrology link",
+        "hydrology WSUD",
+        "hydraulic node",
+        "hydraulic link"
+    };
+
+    std::array<bool, elementTypes.size()> reportedTimeStepFailures{};
+    std::array<bool, elementTypes.size()> reportedSummaryFailures{};
+    std::vector<std::string> summarizedReasons;
+
+    for (const std::string& reason : failReasons)
+    {
+        bool wasSummarized = false;
+        for (size_t i = 0; i < elementTypes.size(); ++i)
+        {
+            const std::string timeStepPrefix = "FAIL time-step " + elementTypes[i];
+            const std::string summaryPrefix = "FAIL summary " + elementTypes[i];
+            const bool isTimeStepFailure =
+                reason.rfind(timeStepPrefix, 0) == 0 ||
+                (reason.find("time-step timestamp not aligned") != std::string::npos &&
+                    reason.find(elementTypes[i]) != std::string::npos);
+
+            if (isTimeStepFailure)
+            {
+                if (!reportedTimeStepFailures[i])
+                {
+                    summarizedReasons.push_back(timeStepPrefix);
+                    reportedTimeStepFailures[i] = true;
+                }
+                wasSummarized = true;
+                break;
+            }
+
+            if (reason.rfind(summaryPrefix, 0) == 0)
+            {
+                if (!reportedSummaryFailures[i])
+                {
+                    summarizedReasons.push_back(summaryPrefix);
+                    reportedSummaryFailures[i] = true;
+                }
+                wasSummarized = true;
+                break;
+            }
+        }
+
+        if (!wasSummarized &&
+            std::find(summarizedReasons.begin(), summarizedReasons.end(), reason) ==
+                summarizedReasons.end())
+        {
+            summarizedReasons.push_back(reason);
+        }
+    }
+
+    return summarizedReasons;
+}
+
 void writeDeviation(std::ostream& output, double deviationPercent)
 {
     output << formatDeviation(deviationPercent);
@@ -3084,21 +3147,24 @@ int compareSubcatchmentsForAllModels(
         else
             ++passedModels;
 
+        const std::vector<std::string> mainReportFailReasons =
+            summarizeMainReportFailReasons(failReasons);
+
         mainReport << std::left << std::setw(mainReportModelWidth) << job.displayName.string()
             << std::setw(mainReportResultWidth) << comparisonStatusText(modelStatus);
 
-        if (modelStatus != ComparisonStatus::Fail || failReasons.empty())
+        if (modelStatus != ComparisonStatus::Fail || mainReportFailReasons.empty())
         {
             mainReport << "\n";
         }
         else
         {
-            mainReport << failReasons.front() << "\n";
-            for (size_t i = 1; i < failReasons.size(); ++i)
+            mainReport << mainReportFailReasons.front() << "\n";
+            for (size_t i = 1; i < mainReportFailReasons.size(); ++i)
             {
                 mainReport << std::setw(mainReportModelWidth) << ""
                     << std::setw(mainReportResultWidth) << ""
-                    << failReasons[i] << "\n";
+                    << mainReportFailReasons[i] << "\n";
             }
         }
     }
