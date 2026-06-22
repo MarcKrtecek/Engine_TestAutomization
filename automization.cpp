@@ -294,6 +294,11 @@ public:
         return static_cast<int64_t>(input_.tellg());
     }
 
+    const fs::path& path() const
+    {
+        return path_;
+    }
+
     void seek(int64_t position)
     {
         input_.seekg(static_cast<std::streamoff>(position), std::ios::beg);
@@ -475,31 +480,99 @@ void readRoutingFooter(BinaryReader& reader, RoutingBinaryLayout& layout)
     const int64_t fileSize = reader.fileSize();
     const int64_t footerSizeWithSummaryOffsets =
         5 * static_cast<int64_t>(sizeof(int64_t)) + 3 * static_cast<int64_t>(sizeof(int32_t));
+    const int64_t legacyFooterSize =
+        3 * static_cast<int64_t>(sizeof(int64_t)) + 3 * static_cast<int64_t>(sizeof(int32_t));
 
     if (fileSize < footerSizeWithSummaryOffsets)
-        throw std::runtime_error("Routing binary is too small to contain a valid footer.");
+        throw std::runtime_error(
+            "Routing binary '" + reader.path().string() +
+            "' is too small to contain the expected footer: file_size=" +
+            std::to_string(fileSize) +
+            ", expected_footer_size=" + std::to_string(footerSizeWithSummaryOffsets) + ".");
 
-    reader.seek(fileSize - footerSizeWithSummaryOffsets);
-    reader.read<int64_t>(); // IDStartPos
+    const int64_t footerStart = fileSize - footerSizeWithSummaryOffsets;
+    reader.seek(footerStart);
+    const int64_t idStartPos = reader.read<int64_t>();
     layout.inputStartPos = reader.read<int64_t>();
     layout.outputStartPos = reader.read<int64_t>();
     layout.nodeSummaryStartPos = reader.read<int64_t>();
     layout.linkSummaryStartPos = reader.read<int64_t>();
     layout.periodCount = reader.read<int32_t>();
-    reader.read<int32_t>(); // ErrorCode
+    const int32_t errorCode = reader.read<int32_t>();
+    const int32_t footerMagic = reader.read<int32_t>();
 
-    if (reader.read<int32_t>() != MAGICNUMBER)
-        throw std::runtime_error("Routing binary has an invalid footer magic number.");
+    std::vector<std::string> invalidFields;
+    if (footerMagic != MAGICNUMBER)
+        invalidFields.push_back("magic_number");
+    if (layout.inputStartPos <= 0)
+        invalidFields.push_back("input_start_pos");
+    if (layout.outputStartPos <= layout.inputStartPos)
+        invalidFields.push_back("output_start_pos");
+    if (layout.outputStartPos >= fileSize)
+        invalidFields.push_back("output_start_pos_outside_file");
+    if (layout.nodeSummaryStartPos < layout.outputStartPos)
+        invalidFields.push_back("node_summary_start_pos");
+    if (layout.nodeSummaryStartPos >= fileSize)
+        invalidFields.push_back("node_summary_start_pos_outside_file");
+    if (layout.linkSummaryStartPos < layout.nodeSummaryStartPos)
+        invalidFields.push_back("link_summary_start_pos");
+    if (layout.linkSummaryStartPos >= fileSize)
+        invalidFields.push_back("link_summary_start_pos_outside_file");
+    if (layout.periodCount < 0)
+        invalidFields.push_back("period_count");
 
-    if (layout.inputStartPos <= 0 ||
-        layout.outputStartPos <= layout.inputStartPos ||
-        layout.outputStartPos >= fileSize ||
-        layout.nodeSummaryStartPos < layout.outputStartPos ||
-        layout.nodeSummaryStartPos >= fileSize ||
-        layout.linkSummaryStartPos < layout.nodeSummaryStartPos ||
-        layout.linkSummaryStartPos >= fileSize ||
-        layout.periodCount < 0)
-        throw std::runtime_error("Routing binary has an invalid footer.");
+    if (!invalidFields.empty())
+    {
+        std::ostringstream message;
+        message << "Routing binary '" << reader.path()
+            << "' has an invalid footer. "
+            << "expected_footer_size=" << footerSizeWithSummaryOffsets
+            << ", file_size=" << fileSize
+            << ", footer_start=" << footerStart
+            << ", decoded={IDStartPos=" << idStartPos
+            << ", InputStartPos=" << layout.inputStartPos
+            << ", OutputStartPos=" << layout.outputStartPos
+            << ", HydraulicNodeSummaryStartPos=" << layout.nodeSummaryStartPos
+            << ", HydraulicLinkSummaryStartPos=" << layout.linkSummaryStartPos
+            << ", Nperiods=" << layout.periodCount
+            << ", ErrorCode=" << errorCode
+            << ", MagicNumber=" << footerMagic
+            << ", expected_magic=" << MAGICNUMBER
+            << "}, invalid_fields=";
+
+        for (size_t i = 0; i < invalidFields.size(); ++i)
+        {
+            if (i > 0)
+                message << ",";
+            message << invalidFields[i];
+        }
+
+        if (fileSize >= legacyFooterSize)
+        {
+            reader.seek(fileSize - legacyFooterSize);
+            const int64_t legacyIdStartPos = reader.read<int64_t>();
+            const int64_t legacyInputStartPos = reader.read<int64_t>();
+            const int64_t legacyOutputStartPos = reader.read<int64_t>();
+            const int32_t legacyPeriodCount = reader.read<int32_t>();
+            const int32_t legacyErrorCode = reader.read<int32_t>();
+            const int32_t legacyMagic = reader.read<int32_t>();
+
+            message << "; legacy_three_offset_footer_probe={IDStartPos=" << legacyIdStartPos
+                << ", InputStartPos=" << legacyInputStartPos
+                << ", OutputStartPos=" << legacyOutputStartPos
+                << ", Nperiods=" << legacyPeriodCount
+                << ", ErrorCode=" << legacyErrorCode
+                << ", MagicNumber=" << legacyMagic
+                << "}";
+            if (legacyMagic == MAGICNUMBER)
+            {
+                message << " (legacy footer magic matches; this binary likely lacks the "
+                    << "hydraulic node/link summary offsets expected by this version)";
+            }
+        }
+
+        throw std::runtime_error(message.str());
+    }
 }
 
 struct RunoffBinaryLayout
@@ -1408,7 +1481,8 @@ int exportTemporaryBinaryTimeSeriesResults(
         catch (const std::exception& e)
         {
             std::cerr << "WARNING: Could not read binary time-series results for model '"
-                << modelName << "': " << e.what() << "\n";
+                << job.displayName << "' from NewResults routing binary '"
+                << routingBinary << "': " << e.what() << "\n";
             ++errors;
         }
     }
@@ -2611,6 +2685,29 @@ ComparisonStatus compareRecordCollections(
     return aggregateStatus;
 }
 
+std::string readEngineVersionFromOutputFile(const fs::path& outputFile)
+{
+    std::ifstream input(outputFile);
+    if (!input)
+        return "UNKNOWN";
+
+    constexpr const char* engineMarker = "DRAINS ENGINE";
+    std::string line;
+    while (std::getline(input, line))
+    {
+        const size_t markerPosition = line.find(engineMarker);
+        if (markerPosition == std::string::npos)
+            continue;
+
+        const std::string version = trim(
+            line.substr(markerPosition + std::char_traits<char>::length(engineMarker)));
+        if (!version.empty())
+            return version;
+    }
+
+    return "UNKNOWN";
+}
+
 ComparisonStatus compareSubcatchmentsForModel(
     const std::string& modelName,
     const fs::path& originalRunoffBinary,
@@ -2634,6 +2731,14 @@ ComparisonStatus compareSubcatchmentsForModel(
     detailReport << "New runoff binary: " << newRunoffBinary << "\n\n";
     detailReport << "Original routing binary: " << originalRoutingBinary << "\n";
     detailReport << "New routing binary: " << newRoutingBinary << "\n\n";
+    const std::string regressionEngineVersion = readEngineVersionFromOutputFile(
+        originalRoutingBinary.parent_path() / (modelName + ".out"));
+    const std::string newEngineVersion = readEngineVersionFromOutputFile(
+        newRoutingBinary.parent_path() / (modelName + ".out"));
+    detailReport << "Regression results were generated with engine version "
+        << regressionEngineVersion << "\n";
+    detailReport << "New results were generated with engine version "
+        << newEngineVersion << "\n\n";
     writeToleranceOverview(detailReport, toleranceSettings, toleranceOverrideMessages);
 
     if (!fs::exists(originalRunoffBinary))
