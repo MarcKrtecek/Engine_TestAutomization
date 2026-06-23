@@ -30,6 +30,7 @@
 #include <stdexcept>
 #include <cctype>
 #include <array>
+#include <tuple>
 
 #include "tolerances.h"
 
@@ -2708,6 +2709,490 @@ std::string readEngineVersionFromOutputFile(const fs::path& outputFile)
     return "UNKNOWN";
 }
 
+struct JsonTimeSeriesCheck
+{
+    std::string variable;
+    std::string status;
+    std::string warnedValues;
+    std::string failedValues;
+    std::string missingValues;
+    std::string skippedValues;
+    std::string maxCheckedDifference;
+    std::string maxDeviationPercent;
+    std::string maxAbsoluteDifference;
+    std::string at;
+    std::string originalAtMax;
+    std::string newAtMax;
+};
+
+struct JsonSummaryCheck
+{
+    std::string variable;
+    std::string status;
+    std::string originalValue;
+    std::string newValue;
+    std::string checkedDifference;
+    std::string mode;
+    std::string deviationPercent;
+    std::string absoluteDifference;
+};
+
+struct JsonElementResult
+{
+    std::string id;
+    std::vector<JsonTimeSeriesCheck> timeSeriesResults;
+    std::vector<JsonSummaryCheck> summaryResults;
+};
+
+std::string escapeJsonString(const std::string& text)
+{
+    std::ostringstream escaped;
+    for (const unsigned char character : text)
+    {
+        switch (character)
+        {
+        case '\\': escaped << "\\\\"; break;
+        case '"': escaped << "\\\""; break;
+        case '\n': escaped << "\\n"; break;
+        case '\r': escaped << "\\r"; break;
+        case '\t': escaped << "\\t"; break;
+        default:
+            if (character < 0x20)
+            {
+                escaped << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                    << static_cast<int>(character) << std::dec << std::setfill(' ');
+            }
+            else
+                escaped << static_cast<char>(character);
+        }
+    }
+    return escaped.str();
+}
+
+std::string jsonNumberOrNull(const std::string& value)
+{
+    const std::string trimmedValue = trim(value);
+    if (trimmedValue.empty() || trimmedValue == "INF" || trimmedValue == "-INF" ||
+        trimmedValue == "NaN")
+    {
+        return "null";
+    }
+
+    try
+    {
+        size_t parsedLength = 0;
+        const double parsedValue = std::stod(trimmedValue, &parsedLength);
+        if (parsedLength != trimmedValue.size() || !std::isfinite(parsedValue))
+            return "null";
+    }
+    catch (const std::exception&)
+    {
+        return "null";
+    }
+    return trimmedValue;
+}
+
+std::string extractReportField(const std::string& line, const std::string& fieldName)
+{
+    const std::string marker = fieldName + "=";
+    const size_t start = line.find(marker);
+    if (start == std::string::npos)
+        return "";
+
+    const size_t valueStart = start + marker.size();
+    const size_t valueEnd = line.find_first_of(" \t", valueStart);
+    return line.substr(valueStart, valueEnd == std::string::npos ? std::string::npos : valueEnd - valueStart);
+}
+
+std::string extractReportFieldUntil(
+    const std::string& line,
+    const std::string& fieldName,
+    const std::string& nextMarker)
+{
+    const std::string marker = fieldName + "=";
+    const size_t start = line.find(marker);
+    if (start == std::string::npos)
+        return "";
+
+    const size_t valueStart = start + marker.size();
+    const size_t valueEnd = line.find(nextMarker, valueStart);
+    return trim(line.substr(valueStart, valueEnd == std::string::npos ? std::string::npos : valueEnd - valueStart));
+}
+
+bool parseReportVariableAndStatus(
+    const std::string& line,
+    std::string& variable,
+    std::string& status)
+{
+    const std::string trimmedLine = trim(line);
+    size_t statusPosition = std::string::npos;
+    for (const std::string& candidate : { std::string("PASS"), std::string("WARN"), std::string("FAIL") })
+    {
+        const size_t position = trimmedLine.find(candidate);
+        if (position != std::string::npos &&
+            (statusPosition == std::string::npos || position < statusPosition))
+        {
+            statusPosition = position;
+            status = candidate;
+        }
+    }
+
+    if (statusPosition == std::string::npos)
+        return false;
+
+    variable = trim(trimmedLine.substr(0, statusPosition));
+    return !variable.empty();
+}
+
+JsonElementResult& findOrAddJsonElement(
+    std::map<std::string, std::vector<JsonElementResult>>& categories,
+    const std::string& category,
+    const std::string& id)
+{
+    std::vector<JsonElementResult>& elements = categories[category];
+    for (JsonElementResult& element : elements)
+    {
+        if (element.id == id)
+            return element;
+    }
+
+    elements.push_back({ id });
+    return elements.back();
+}
+
+std::map<std::string, std::vector<JsonElementResult>> parseComparisonTextReport(
+    const fs::path& detailReportPath)
+{
+    std::ifstream input(detailReportPath);
+    if (!input)
+        throw std::runtime_error("Could not read detailed comparison report: " + detailReportPath.string());
+
+    const std::array<std::tuple<std::string, std::string, bool>, 12> sectionHeaders =
+    {
+        std::tuple{ "Subcatchment summary: ", "Subcatchments", true },
+        std::tuple{ "Subcatchment: ", "Subcatchments", false },
+        std::tuple{ "Hydrology node summary: ", "Hydrology_Nodes", true },
+        std::tuple{ "Hydrology node: ", "Hydrology_Nodes", false },
+        std::tuple{ "Hydrology link summary: ", "Hydrology_Links", true },
+        std::tuple{ "Hydrology link: ", "Hydrology_Links", false },
+        std::tuple{ "Hydrology WSUD summary: ", "Hydrology_WSUD", true },
+        std::tuple{ "Hydrology WSUD: ", "Hydrology_WSUD", false },
+        std::tuple{ "Hydraulic node summary: ", "Hydraulic_Nodes", true },
+        std::tuple{ "Hydraulic node: ", "Hydraulic_Nodes", false },
+        std::tuple{ "Hydraulic link summary: ", "Hydraulic_Links", true },
+        std::tuple{ "Hydraulic link: ", "Hydraulic_Links", false }
+    };
+
+    std::map<std::string, std::vector<JsonElementResult>> categories;
+    JsonElementResult* currentElement = nullptr;
+    bool parsingSummary = false;
+    std::string line;
+    while (std::getline(input, line))
+    {
+        bool foundHeader = false;
+        for (const auto& [header, category, isSummary] : sectionHeaders)
+        {
+            if (line.rfind(header, 0) == 0)
+            {
+                currentElement = &findOrAddJsonElement(
+                    categories,
+                    category,
+                    trim(line.substr(header.size())));
+                parsingSummary = isSummary;
+                foundHeader = true;
+                break;
+            }
+        }
+        if (foundHeader || !currentElement)
+            continue;
+
+        std::string variable;
+        std::string status;
+        if (!parseReportVariableAndStatus(line, variable, status))
+            continue;
+
+        if (!parsingSummary && line.find("warned_values=") != std::string::npos)
+        {
+            JsonTimeSeriesCheck check;
+            check.variable = variable;
+            check.status = status;
+            check.warnedValues = extractReportField(line, "warned_values");
+            check.failedValues = extractReportField(line, "failed_values");
+            check.missingValues = extractReportField(line, "missing_values");
+            check.skippedValues = extractReportField(line, "skipped_values");
+            check.maxCheckedDifference = extractReportField(line, "max_checked_difference");
+            check.maxDeviationPercent = extractReportField(line, "max_deviation_percent");
+            check.maxAbsoluteDifference = extractReportField(line, "max_absolute_difference");
+            check.at = extractReportFieldUntil(line, "at", "  original_at_max=");
+            check.originalAtMax = extractReportField(line, "original_at_max");
+            check.newAtMax = extractReportField(line, "new_at_max");
+            currentElement->timeSeriesResults.push_back(std::move(check));
+        }
+        else if (parsingSummary && line.find("original=") != std::string::npos)
+        {
+            JsonSummaryCheck check;
+            check.variable = variable;
+            check.status = status;
+            check.originalValue = extractReportField(line, "original");
+            check.newValue = extractReportField(line, "new");
+            check.checkedDifference = extractReportField(line, "checked_difference");
+            check.mode = extractReportField(line, "mode");
+            check.deviationPercent = extractReportField(line, "deviation_percent");
+            check.absoluteDifference = extractReportField(line, "absolute_difference");
+            currentElement->summaryResults.push_back(std::move(check));
+        }
+    }
+    return categories;
+}
+
+void writeJsonToleranceRule(std::ostream& output, const ToleranceRule& rule, int indent)
+{
+    const std::string spacing(static_cast<size_t>(indent), ' ');
+    output << "{\n"
+        << spacing << "  \"warn_percent\": " << rule.warnAbovePercent << ",\n"
+        << spacing << "  \"fail_percent\": " << rule.failAbovePercent << ",\n"
+        << spacing << "  \"warn_absolute\": " << rule.warnAboveAbsolute << ",\n"
+        << spacing << "  \"fail_absolute\": " << rule.failAboveAbsolute << ",\n"
+        << spacing << "  \"near_zero\": " << rule.nearZeroThreshold << ",\n"
+        << spacing << "  \"absolute_always\": " << (rule.useAbsoluteAlways ? "true" : "false") << ",\n"
+        << spacing << "  \"absolute_below_near_zero\": "
+        << (rule.useAbsoluteBelowNearZero ? "true" : "false") << "\n"
+        << spacing << "}";
+}
+
+void writeJsonTimeSeriesCheck(std::ostream& output, const JsonTimeSeriesCheck& check, int indent)
+{
+    const std::string spacing(static_cast<size_t>(indent), ' ');
+    output << spacing << "{\n"
+        << spacing << "  \"variable\": \"" << escapeJsonString(check.variable) << "\",\n"
+        << spacing << "  \"status\": \"" << escapeJsonString(check.status) << "\",\n"
+        << spacing << "  \"warned_values\": " << jsonNumberOrNull(check.warnedValues) << ",\n"
+        << spacing << "  \"failed_values\": " << jsonNumberOrNull(check.failedValues) << ",\n"
+        << spacing << "  \"missing_values\": " << jsonNumberOrNull(check.missingValues) << ",\n"
+        << spacing << "  \"skipped_values\": " << jsonNumberOrNull(check.skippedValues) << ",\n"
+        << spacing << "  \"max_checked_difference\": " << jsonNumberOrNull(check.maxCheckedDifference) << ",\n"
+        << spacing << "  \"max_deviation_percent\": " << jsonNumberOrNull(check.maxDeviationPercent) << ",\n"
+        << spacing << "  \"max_absolute_difference\": " << jsonNumberOrNull(check.maxAbsoluteDifference) << ",\n"
+        << spacing << "  \"at\": \"" << escapeJsonString(check.at) << "\",\n"
+        << spacing << "  \"original_at_max\": " << jsonNumberOrNull(check.originalAtMax) << ",\n"
+        << spacing << "  \"new_at_max\": " << jsonNumberOrNull(check.newAtMax) << "\n"
+        << spacing << "}";
+}
+
+void writeJsonSummaryCheck(std::ostream& output, const JsonSummaryCheck& check, int indent)
+{
+    const std::string spacing(static_cast<size_t>(indent), ' ');
+    output << spacing << "{\n"
+        << spacing << "  \"variable\": \"" << escapeJsonString(check.variable) << "\",\n"
+        << spacing << "  \"status\": \"" << escapeJsonString(check.status) << "\",\n"
+        << spacing << "  \"original\": " << jsonNumberOrNull(check.originalValue) << ",\n"
+        << spacing << "  \"new\": " << jsonNumberOrNull(check.newValue) << ",\n"
+        << spacing << "  \"checked_difference\": " << jsonNumberOrNull(check.checkedDifference) << ",\n"
+        << spacing << "  \"mode\": \"" << escapeJsonString(check.mode) << "\",\n"
+        << spacing << "  \"deviation_percent\": " << jsonNumberOrNull(check.deviationPercent) << ",\n"
+        << spacing << "  \"absolute_difference\": " << jsonNumberOrNull(check.absoluteDifference) << "\n"
+        << spacing << "}";
+}
+
+void writeJsonElements(
+    std::ostream& output,
+    const std::vector<JsonElementResult>& elements,
+    int indent)
+{
+    const std::string spacing(static_cast<size_t>(indent), ' ');
+    output << "[\n";
+    for (size_t i = 0; i < elements.size(); ++i)
+    {
+        const JsonElementResult& element = elements[i];
+        output << spacing << "{\n"
+            << spacing << "  \"id\": \"" << escapeJsonString(element.id) << "\",\n"
+            << spacing << "  \"timeseries_results\": [\n";
+        for (size_t j = 0; j < element.timeSeriesResults.size(); ++j)
+        {
+            writeJsonTimeSeriesCheck(output, element.timeSeriesResults[j], indent + 4);
+            output << (j + 1 == element.timeSeriesResults.size() ? "\n" : ",\n");
+        }
+        output << spacing << "  ],\n"
+            << spacing << "  \"summary_results\": [\n";
+        for (size_t j = 0; j < element.summaryResults.size(); ++j)
+        {
+            writeJsonSummaryCheck(output, element.summaryResults[j], indent + 4);
+            output << (j + 1 == element.summaryResults.size() ? "\n" : ",\n");
+        }
+        output << spacing << "  ]\n"
+            << spacing << "}" << (i + 1 == elements.size() ? "\n" : ",\n");
+    }
+    output << std::string(static_cast<size_t>(indent - 2), ' ') << "]";
+}
+
+struct JsonCheckTotals
+{
+    int total = 0;
+    int passed = 0;
+    int warned = 0;
+    int failed = 0;
+};
+
+JsonCheckTotals calculateJsonCheckTotals(const std::vector<JsonElementResult>& elements)
+{
+    JsonCheckTotals totals;
+    const auto addStatus = [&totals](const std::string& status)
+    {
+        ++totals.total;
+        if (status == "PASS") ++totals.passed;
+        else if (status == "WARN") ++totals.warned;
+        else if (status == "FAIL") ++totals.failed;
+    };
+
+    for (const JsonElementResult& element : elements)
+    {
+        for (const JsonTimeSeriesCheck& check : element.timeSeriesResults)
+            addStatus(check.status);
+        for (const JsonSummaryCheck& check : element.summaryResults)
+            addStatus(check.status);
+    }
+    return totals;
+}
+
+void writeComparisonResultJson(
+    const fs::path& jsonReportPath,
+    const fs::path& textReportPath,
+    const std::string& modelName,
+    const fs::path& originalRunoffBinary,
+    const fs::path& newRunoffBinary,
+    const fs::path& originalRoutingBinary,
+    const fs::path& newRoutingBinary,
+    const RunoffBinaryResults& originalResults,
+    const RunoffBinaryResults& newResults,
+    const RoutingBinaryResults& originalRoutingResults,
+    const RoutingBinaryResults& newRoutingResults,
+    const ToleranceSettings& toleranceSettings,
+    const std::vector<std::string>& toleranceOverrideMessages,
+    ComparisonStatus modelStatus)
+{
+    const auto categories = parseComparisonTextReport(textReportPath);
+    std::ofstream output(jsonReportPath);
+    if (!output)
+        throw std::runtime_error("Could not create JSON comparison report: " + jsonReportPath.string());
+
+    const std::array<std::pair<std::string, std::string>, 6> categoriesInOutputOrder =
+    {
+        std::pair{ "Subcatchments", "Subcatchments" },
+        std::pair{ "Hydrology_Nodes", "Hydrology_Nodes" },
+        std::pair{ "Hydrology_Links", "Hydrology_Links" },
+        std::pair{ "Hydrology_WSUD", "Hydrology_WSUD" },
+        std::pair{ "Hydraulic_Nodes", "Hydraulic_Nodes" },
+        std::pair{ "Hydraulic_Links", "Hydraulic_Links" }
+    };
+
+    const std::string referenceEngineVersion = readEngineVersionFromOutputFile(
+        originalRoutingBinary.parent_path() / (modelName + ".out"));
+    const std::string newEngineVersion = readEngineVersionFromOutputFile(
+        newRoutingBinary.parent_path() / (modelName + ".out"));
+
+    output << "{\n  \"Metadata\": {\n"
+        << "    \"model\": \"" << escapeJsonString(modelName) << "\",\n"
+        << "    \"original_runoff_binary\": \"" << escapeJsonString(originalRunoffBinary.string()) << "\",\n"
+        << "    \"new_runoff_binary\": \"" << escapeJsonString(newRunoffBinary.string()) << "\",\n"
+        << "    \"original_routing_binary\": \"" << escapeJsonString(originalRoutingBinary.string()) << "\",\n"
+        << "    \"new_routing_binary\": \"" << escapeJsonString(newRoutingBinary.string()) << "\",\n"
+        << "    \"reference_engine_version\": \"" << escapeJsonString(referenceEngineVersion) << "\",\n"
+        << "    \"new_engine_version\": \"" << escapeJsonString(newEngineVersion) << "\"\n"
+        << "  },\n  \"Tolerance_Settings\": {\n";
+
+    const std::array<std::pair<std::string, ToleranceQuantity>, 11> toleranceNames =
+    {
+        std::pair{ "flow", ToleranceQuantity::Flow },
+        std::pair{ "volume", ToleranceQuantity::Volume },
+        std::pair{ "depth", ToleranceQuantity::Depth },
+        std::pair{ "water_surface_profile", ToleranceQuantity::WaterSurfaceProfile },
+        std::pair{ "velocity", ToleranceQuantity::Velocity },
+        std::pair{ "continuity_error", ToleranceQuantity::ContinuityError },
+        std::pair{ "time", ToleranceQuantity::Time },
+        std::pair{ "count", ToleranceQuantity::Count },
+        std::pair{ "percent_point", ToleranceQuantity::PercentPoint },
+        std::pair{ "flow_regime", ToleranceQuantity::FlowRegime },
+        std::pair{ "pollutant_load", ToleranceQuantity::PollutantLoad }
+    };
+    for (size_t i = 0; i < toleranceNames.size(); ++i)
+    {
+        output << "    \"" << toleranceNames[i].first << "\": ";
+        writeJsonToleranceRule(output, toleranceRule(toleranceSettings, toleranceNames[i].second), 4);
+        output << (i + 1 == toleranceNames.size() ? "\n" : ",\n");
+    }
+
+    output << "  },\n  \"Tolerance_Overrides\": [\n";
+    for (size_t i = 0; i < toleranceOverrideMessages.size(); ++i)
+    {
+        const std::string& message = toleranceOverrideMessages[i];
+        const std::string settingPrefix = "Global setting for ";
+        const std::string valuePrefix = "the new setting is: ";
+        const size_t settingStart = message.find(settingPrefix);
+        const size_t settingEnd = message.find(" was overwritten", settingStart);
+        const size_t valueStart = message.find(valuePrefix);
+        const std::string setting = settingStart == std::string::npos || settingEnd == std::string::npos ?
+            message : message.substr(settingStart + settingPrefix.size(), settingEnd - settingStart - settingPrefix.size());
+        const std::string value = valueStart == std::string::npos ? "" :
+            trim(message.substr(valueStart + valuePrefix.size()));
+        output << "    { \"setting\": \"" << escapeJsonString(setting) << "\", \"new_value\": "
+            << jsonNumberOrNull(value) << " }"
+            << (i + 1 == toleranceOverrideMessages.size() ? "\n" : ",\n");
+    }
+
+    output << "  ],\n  \"Element_Counts\": {\n"
+        << "    \"subcatchment\": { \"original_count\": " << originalResults.layout.subcatchCount << ", \"new_count\": " << newResults.layout.subcatchCount << " },\n"
+        << "    \"hydrology_node\": { \"original_count\": " << originalResults.layout.hydrologyNodeCount << ", \"new_count\": " << newResults.layout.hydrologyNodeCount << " },\n"
+        << "    \"hydrology_link\": { \"original_count\": " << originalResults.layout.hydrologyLinkCount << ", \"new_count\": " << newResults.layout.hydrologyLinkCount << " },\n"
+        << "    \"hydrology_WSUD\": { \"original_count\": " << originalResults.layout.wsudCount << ", \"new_count\": " << newResults.layout.wsudCount << " },\n"
+        << "    \"hydraulic_node\": { \"original_count\": " << originalRoutingResults.layout.nodeCount << ", \"new_count\": " << newRoutingResults.layout.nodeCount << " },\n"
+        << "    \"hydraulic_link\": { \"original_count\": " << originalRoutingResults.layout.linkCount << ", \"new_count\": " << newRoutingResults.layout.linkCount << " }\n"
+        << "  },\n";
+
+    for (const auto& [jsonName, categoryName] : categoriesInOutputOrder)
+    {
+        const auto category = categories.find(categoryName);
+        const std::vector<JsonElementResult> emptyElements;
+        const std::vector<JsonElementResult>& elements =
+            category == categories.end() ? emptyElements : category->second;
+        output << "  \"" << jsonName << "\": ";
+        writeJsonElements(output, elements, 4);
+        output << ",\n";
+    }
+
+    output << "  \"Overall_Result\": \"" << comparisonStatusText(modelStatus) << "\",\n"
+        << "  \"Summary\": {\n";
+
+    JsonCheckTotals overallTotals;
+    for (size_t i = 0; i < categoriesInOutputOrder.size(); ++i)
+    {
+        const auto category = categories.find(categoriesInOutputOrder[i].second);
+        const std::vector<JsonElementResult> emptyElements;
+        const std::vector<JsonElementResult>& elements =
+            category == categories.end() ? emptyElements : category->second;
+        const JsonCheckTotals totals = calculateJsonCheckTotals(elements);
+        overallTotals.total += totals.total;
+        overallTotals.passed += totals.passed;
+        overallTotals.warned += totals.warned;
+        overallTotals.failed += totals.failed;
+        const double passRate = totals.total == 0 ? 100.0 : 100.0 * totals.passed / totals.total;
+        output << "    \"" << categoriesInOutputOrder[i].first << "\": { \"element_count\": "
+            << elements.size() << ", \"total_checks\": " << totals.total
+            << ", \"passed\": " << totals.passed
+            << ", \"warned\": " << totals.warned
+            << ", \"failed\": " << totals.failed
+            << ", \"pass_rate_%\": " << std::fixed << std::setprecision(1) << passRate << " }"
+            << ",\n";
+    }
+    const double overallPassRate = overallTotals.total == 0 ? 100.0 :
+        100.0 * overallTotals.passed / overallTotals.total;
+    output << "    \"Overall\": { \"total_checks\": " << overallTotals.total
+        << ", \"passed\": " << overallTotals.passed
+        << ", \"warned\": " << overallTotals.warned
+        << ", \"failed\": " << overallTotals.failed
+        << ", \"pass_rate_%\": " << std::fixed << std::setprecision(1) << overallPassRate << " }\n"
+        << "  }\n}\n";
+}
+
 ComparisonStatus compareSubcatchmentsForModel(
     const std::string& modelName,
     const fs::path& originalRunoffBinary,
@@ -3157,6 +3642,22 @@ ComparisonStatus compareSubcatchmentsForModel(
     }
 
     detailReport << "\nModel result: " << comparisonStatusText(modelStatus) << "\n";
+    detailReport.close();
+    writeComparisonResultJson(
+        detailReportPath.parent_path() / "comparison_result.json",
+        detailReportPath,
+        modelName,
+        originalRunoffBinary,
+        newRunoffBinary,
+        originalRoutingBinary,
+        newRoutingBinary,
+        originalResults,
+        newResults,
+        originalRoutingResults,
+        newRoutingResults,
+        toleranceSettings,
+        toleranceOverrideMessages,
+        modelStatus);
     return modelStatus;
 }
 
